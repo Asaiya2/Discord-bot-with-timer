@@ -1,0 +1,1269 @@
+import discord
+from discord.ext import commands
+import sqlite3
+import time
+import os
+import asyncio
+import random
+import re
+import aiohttp
+import io
+from datetime import datetime
+
+# ===== CONFIGURATION =====
+DB_FOLDER = r"C:\Users\Kelly\Desktop\discord database"
+MAIN_DB_PATH = os.path.join(DB_FOLDER, "asaiya_bot.db")
+
+STORAGE_SERVER_ID  = 1484265140215087235
+VAULT_CHANNEL_NAME = "asaiya-vault"
+STAFF_ROLES        = ["AsaiyaBot", "AsaiyaKick", "AsaiyaBan", "AsaiyaPass", "AsaiyaClear", "asaiya-support"]
+OWNER_SERVER_ID    = 1484265140215087235
+BOT_ROLE           = "AsaiyaBot"
+
+# ===== COOLDOWNS (seconds) =====
+COOLDOWN_IMAGE = 2
+COOLDOWN_GIF   = 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STANDALONE HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _detect_media_type(url: str, content_type: str = "") -> str:
+    """Return 'gif' | 'image' | 'unknown'. No video support."""
+    lower = url.lower().split("?")[0]
+    ct    = content_type.lower()
+
+    # Giphy and Tenor are ALWAYS treated as gifs
+    if "tenor.com" in lower or "giphy.com" in lower:
+        return "gif"
+
+    if ct == "image/gif" or lower.endswith(".gif"):
+        return "gif"
+
+    image_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".avif")
+    if ct.startswith("image/") or any(lower.endswith(e) for e in image_exts):
+        return "image"
+
+    return "unknown"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AbsoluteDetect(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.processed_commands = {}
+        self.processed_messages = set()
+        self.media_cooldowns = {}
+        self.setup_database()
+        print("✅ AbsoluteDetect cog initialized")
+
+    # ── DATABASE SETUP ─────────────────────────────────────────────────────────
+
+    def setup_database(self):
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='media_vault'")
+            table_exists = c.fetchone()
+
+            if not table_exists:
+                c.execute("""
+                    CREATE TABLE media_vault (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        media_type   TEXT NOT NULL,
+                        url          TEXT NOT NULL,
+                        saved_by     TEXT NOT NULL,
+                        saved_by_id  TEXT NOT NULL,
+                        saved_at     REAL NOT NULL,
+                        vault_msg_id TEXT,
+                        keyword      TEXT
+                    )
+                """)
+            else:
+                c.execute("PRAGMA table_info(media_vault)")
+                columns = [col[1] for col in c.fetchall()]
+                if 'keyword' not in columns:
+                    c.execute("ALTER TABLE media_vault ADD COLUMN keyword TEXT")
+
+            c.execute("CREATE INDEX IF NOT EXISTS idx_keyword ON media_vault(keyword)")
+            c.execute("CREATE TABLE IF NOT EXISTS vault_config (key TEXT PRIMARY KEY, value TEXT)")
+
+            c.execute('''CREATE TABLE IF NOT EXISTS message_detections (
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             guild_id TEXT NOT NULL,
+                             trigger_text TEXT NOT NULL,
+                             response_text TEXT NOT NULL,
+                             created_by TEXT NOT NULL,
+                             created_at REAL NOT NULL,
+                             UNIQUE(guild_id, trigger_text)
+                         )''')
+
+            c.execute('''CREATE TABLE IF NOT EXISTS detection_logs (
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             guild_id TEXT NOT NULL,
+                             trigger_text TEXT NOT NULL,
+                             response_text TEXT NOT NULL,
+                             triggered_by TEXT NOT NULL,
+                             triggered_in TEXT NOT NULL,
+                             triggered_at REAL NOT NULL
+                         )''')
+
+            c.execute('''CREATE TABLE IF NOT EXISTS exempt_channels (
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             guild_id TEXT NOT NULL,
+                             channel_id TEXT NOT NULL,
+                             added_by TEXT NOT NULL,
+                             added_at REAL NOT NULL,
+                             UNIQUE(guild_id, channel_id)
+                         )''')
+
+            conn.commit()
+            conn.close()
+            print("✅ Database initialized")
+        except Exception as e:
+            print(f"❌ Database error: {e}")
+
+    # ── HELPER METHODS ─────────────────────────────────────────────────────────
+
+    async def check_duplicate(self, ctx):
+        key = f"{ctx.author.id}:{ctx.command.name}"
+        now = time.time()
+        last = self.processed_commands.get(key, 0)
+        if now - last < 3:
+            return True
+        self.processed_commands[key] = now
+        if len(self.processed_commands) > 100:
+            self.processed_commands = {k: v for k, v in self.processed_commands.items() if now - v <= 10}
+        return False
+
+    def is_staff(self, member):
+        if not isinstance(member, discord.Member):
+            return False
+        return any(r.name in STAFF_ROLES for r in member.roles)
+
+    def is_owner_server(self, ctx):
+        if not ctx.guild or ctx.guild.id != OWNER_SERVER_ID:
+            return False
+        return isinstance(ctx.author, discord.Member) and any(r.name == BOT_ROLE for r in ctx.author.roles)
+
+    async def get_vault_channel(self):
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT value FROM vault_config WHERE key = 'vault_channel_id'")
+            row = c.fetchone()
+            conn.close()
+            if row and row[0]:
+                guild = self.bot.get_guild(STORAGE_SERVER_ID)
+                if guild:
+                    ch = guild.get_channel(int(row[0]))
+                    if ch:
+                        return ch
+        except Exception as e:
+            print(f"Error: {e}")
+        guild = self.bot.get_guild(STORAGE_SERVER_ID)
+        if not guild:
+            return None
+        return discord.utils.get(guild.text_channels, name=VAULT_CHANNEL_NAME)
+
+    def _check_media_cooldown(self, channel_id: int, media_type: str) -> float:
+        cooldown_map = {"image": COOLDOWN_IMAGE, "gif": COOLDOWN_GIF}
+        cooldown = cooldown_map.get(media_type, 2)
+        key = f"{channel_id}:{media_type}"
+        last = self.media_cooldowns.get(key, 0)
+        elapsed = time.time() - last
+        if elapsed < cooldown:
+            return cooldown - elapsed
+        return 0
+
+    def _set_media_cooldown(self, channel_id: int, media_type: str):
+        key = f"{channel_id}:{media_type}"
+        self.media_cooldowns[key] = time.time()
+
+    # ── DETECTOR DB METHODS ────────────────────────────────────────────────────
+
+    def _load_detections(self, guild_id: int) -> dict:
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT trigger_text, response_text, created_by, created_at FROM message_detections WHERE guild_id = ?",
+                      (str(guild_id),))
+            rows = c.fetchall()
+            conn.close()
+            result = {}
+            for trigger, response, created_by, created_at in rows:
+                result[trigger.lower()] = {
+                    "response": response,
+                    "original_trigger": trigger,
+                    "created_by": int(created_by),
+                    "created_at": created_at
+                }
+            return result
+        except Exception as e:
+            print(f"Error loading detections: {e}")
+            return {}
+
+    def _save_detection(self, guild_id: int, trigger: str, response: str, created_by: int) -> bool:
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute('''INSERT OR REPLACE INTO message_detections
+                         (guild_id, trigger_text, response_text, created_by, created_at)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (str(guild_id), trigger, response, str(created_by), time.time()))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error saving detection: {e}")
+            return False
+
+    def _delete_detection(self, guild_id: int, trigger: str) -> bool:
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM message_detections WHERE guild_id = ? AND trigger_text = ?",
+                      (str(guild_id), trigger))
+            deleted = c.rowcount
+            conn.commit()
+            conn.close()
+            return deleted > 0
+        except Exception as e:
+            print(f"Error deleting detection: {e}")
+            return False
+
+    def _log_detection(self, guild_id, trigger, response, user_id, channel_id):
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute('''INSERT INTO detection_logs
+                         (guild_id, trigger_text, response_text, triggered_by, triggered_in, triggered_at)
+                         VALUES (?, ?, ?, ?, ?, ?)''',
+                      (str(guild_id), trigger, response, str(user_id), str(channel_id), time.time()))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error logging detection: {e}")
+
+    def _save_exemption(self, guild_id, channel_id, added_by) -> bool:
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute('''INSERT OR IGNORE INTO exempt_channels (guild_id, channel_id, added_by, added_at)
+                         VALUES (?, ?, ?, ?)''',
+                      (str(guild_id), str(channel_id), str(added_by), time.time()))
+            inserted = c.rowcount
+            conn.commit()
+            conn.close()
+            return inserted > 0
+        except Exception as e:
+            print(f"Error saving exemption: {e}")
+            return False
+
+    def _delete_exemption(self, guild_id, channel_id) -> bool:
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM exempt_channels WHERE guild_id = ? AND channel_id = ?",
+                      (str(guild_id), str(channel_id)))
+            deleted = c.rowcount
+            conn.commit()
+            conn.close()
+            return deleted > 0
+        except Exception as e:
+            print(f"Error deleting exemption: {e}")
+            return False
+
+    def _load_exemptions(self, guild_id: int) -> set:
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT channel_id FROM exempt_channels WHERE guild_id = ?", (str(guild_id),))
+            rows = c.fetchall()
+            conn.close()
+            return {int(r[0]) for r in rows}
+        except:
+            return set()
+
+    # ── MEDIA VAULT DB METHODS ─────────────────────────────────────────────────
+
+    def _get_all_entries(self, media_type: str = None):
+        conn = sqlite3.connect(MAIN_DB_PATH)
+        c = conn.cursor()
+        if media_type:
+            c.execute(
+                "SELECT id, url, saved_by, saved_by_id, saved_at, vault_msg_id, keyword "
+                "FROM media_vault WHERE media_type=? ORDER BY id ASC",
+                (media_type,)
+            )
+        else:
+            c.execute(
+                "SELECT id, url, saved_by, saved_by_id, saved_at, vault_msg_id, keyword "
+                "FROM media_vault ORDER BY id ASC"
+            )
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def _get_entry_by_number(self, media_type: str, number: int):
+        rows = self._get_all_entries(media_type)
+        if 1 <= number <= len(rows):
+            return rows[number - 1]
+        return None
+
+    def _get_next_id(self, media_type: str) -> int:
+        return len(self._get_all_entries(media_type)) + 1
+
+    def _update_vault_msg_id(self, db_id: int, msg_id: int):
+        conn = sqlite3.connect(MAIN_DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE media_vault SET vault_msg_id=? WHERE id=?", (str(msg_id), db_id))
+        conn.commit()
+        conn.close()
+
+    def _get_entries_by_keyword(self, keyword: str):
+        conn = sqlite3.connect(MAIN_DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, media_type, url, saved_by, saved_by_id, saved_at, vault_msg_id, keyword "
+            "FROM media_vault WHERE LOWER(keyword) = LOWER(?)",
+            (keyword,)
+        )
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def _save_media_db(self, media_type, url, saved_by, saved_by_id, keyword=None):
+        conn = sqlite3.connect(MAIN_DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO media_vault (media_type, url, saved_by, saved_by_id, saved_at, keyword) VALUES (?,?,?,?,?,?)",
+            (media_type, url, saved_by, saved_by_id, time.time(), keyword)
+        )
+        db_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return db_id
+
+    def _delete_entry(self, media_id: int):
+        conn = sqlite3.connect(MAIN_DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM media_vault WHERE id=?", (media_id,))
+        conn.commit()
+        conn.close()
+
+    def _delete_all_entries(self, media_type: str):
+        conn = sqlite3.connect(MAIN_DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT vault_msg_id FROM media_vault WHERE media_type=?", (media_type,))
+        msg_ids = [row[0] for row in c.fetchall() if row[0]]
+        c.execute("DELETE FROM media_vault WHERE media_type=?", (media_type,))
+        conn.commit()
+        conn.close()
+        return msg_ids
+
+    def _get_random_entry(self, media_type: str):
+        rows = self._get_all_entries(media_type)
+        return random.choice(rows) if rows else None
+
+    def _type_display(self, media_type: str):
+        return {
+            "image": ("🖼️", "Image", "img"),
+            "gif":   ("🎞️", "GIF",   "gif"),
+        }.get(media_type, ("📎", media_type.title(), media_type))
+
+    # ── MEDIA EXTRACTION ─────────────────────────────────────────────────────
+
+    async def _extract_media(self, message: discord.Message):
+        """
+        Extract media from a message. Returns (url, 'image'|'gif').
+        Giphy and Tenor links are ALWAYS treated as gifs.
+        No video support.
+        """
+        # 1. Check raw content for giphy/tenor URL first (highest priority)
+        for part in message.content.strip().split():
+            if part.startswith("http"):
+                if "giphy.com" in part.lower() or "tenor.com" in part.lower():
+                    return part, "gif"
+
+        # 2. Attachments
+        if message.attachments:
+            att   = message.attachments[0]
+            ct    = att.content_type or ""
+            mtype = _detect_media_type(att.url, ct)
+            if mtype == "unknown":
+                mtype = "gif" if att.filename.lower().endswith(".gif") else "image"
+            return att.url, mtype
+
+        # 3. Embeds
+        if message.embeds:
+            em = message.embeds[0]
+
+            # If the embed's page URL is a giphy/tenor page, it's a gif
+            embed_url = em.url or ""
+            if "giphy.com" in embed_url.lower() or "tenor.com" in embed_url.lower():
+                # Grab best available media URL from the embed
+                media_url = (
+                    (em.image.url   if em.image     else None) or
+                    (em.thumbnail.url if em.thumbnail else None) or
+                    (em.video.url   if em.video     else None)
+                )
+                if media_url:
+                    return media_url, "gif"
+
+            # Regular image embed
+            if em.image and em.image.url:
+                mtype = _detect_media_type(em.image.url)
+                return em.image.url, mtype if mtype != "unknown" else "image"
+            if em.thumbnail and em.thumbnail.url:
+                mtype = _detect_media_type(em.thumbnail.url)
+                return em.thumbnail.url, mtype if mtype != "unknown" else "image"
+
+        # 4. Bare URL in content
+        for part in message.content.strip().split():
+            if part.startswith("http"):
+                mtype = _detect_media_type(part)
+                return part, mtype if mtype != "unknown" else "image"
+
+        return None, None
+
+    # ── ON_MESSAGE ────────────────────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot or not message.guild:
+            return
+
+        if message.id in self.processed_messages:
+            return
+        self.processed_messages.add(message.id)
+        if len(self.processed_messages) > 500:
+            self.processed_messages.clear()
+
+        content = message.content.lower().strip()
+        if not content or content.startswith('!'):
+            return
+
+        guild_id = message.guild.id
+
+        # ===== SYSTEM 1: TEXT DETECTION =====
+        exempt_channels = self._load_exemptions(guild_id)
+        if message.channel.id not in exempt_channels:
+            detections = self._load_detections(guild_id)
+            if detections:
+                for trigger, data in detections.items():
+                    if trigger in content:
+                        response = data["response"]
+                        try:
+                            await message.channel.send(response)
+                            self._log_detection(guild_id, data["original_trigger"], response,
+                                                message.author.id, message.channel.id)
+                            try:
+                                await message.add_reaction("🔍")
+                            except:
+                                pass
+                        except Exception as e:
+                            print(f"Detection send error: {e}")
+                        break
+
+        # ===== SYSTEM 2: MEDIA KEYWORD DETECTION =====
+        all_media = self._get_all_entries()
+        if all_media:
+            matched = []
+            for media in all_media:
+                kw = media[6]
+                if kw and kw.lower() in content:
+                    matched.append(kw.lower())
+
+            if matched:
+                for keyword in list(set(matched)):
+                    entries = self._get_entries_by_keyword(keyword)
+                    if not entries:
+                        continue
+
+                    entry      = random.choice(entries)
+                    media_type = entry[1]
+                    media_url  = entry[2]
+
+                    remaining = self._check_media_cooldown(message.channel.id, media_type)
+                    if remaining > 0:
+                        continue
+
+                    try:
+                        if media_type == "gif":
+                            await message.channel.send(media_url)
+                        else:
+                            try:
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.get(media_url) as resp:
+                                        if resp.status == 200:
+                                            data = await resp.read()
+                                            filename = media_url.split("/")[-1].split("?")[0] or f"image_{entry[0]}.png"
+                                            await message.channel.send(
+                                                file=discord.File(fp=io.BytesIO(data), filename=filename)
+                                            )
+                                        else:
+                                            await message.channel.send(media_url)
+                            except:
+                                await message.channel.send(media_url)
+
+                        self._set_media_cooldown(message.channel.id, media_type)
+                        try:
+                            await message.add_reaction("🖼️")
+                        except:
+                            pass
+                    except Exception as e:
+                        print(f"Error sending keyword media: {e}")
+
+    # ── CORE SAVE ────────────────────────────────────────────────────────────
+
+    async def _do_save(self, ctx, url: str, media_type: str, keyword: str = None):
+        vault_ch = await self.get_vault_channel()
+        if not vault_ch:
+            await ctx.send(f"❌ Vault channel not found. Run `!vaultsetup` in server `{STORAGE_SERVER_ID}`.")
+            return
+
+        number            = self._get_next_id(media_type)
+        emoji, label, pfx = self._type_display(media_type)
+        retrieve_cmd      = f"!{pfx} {number}"
+        saved_by_str      = ctx.author.name if ctx.author.discriminator == "0" \
+                            else f"{ctx.author.name}#{ctx.author.discriminator}"
+
+        db_id  = self._save_media_db(media_type, url, saved_by_str, str(ctx.author.id), keyword)
+        header = f"{emoji} **{label} #{number}** | Saved by **{saved_by_str}** | Use: `{retrieve_cmd}`"
+        if keyword:
+            header += f" | Keyword: `{keyword}`"
+
+        vault_msg = None
+
+        if media_type == "gif":
+            await vault_ch.send(url)
+            vault_msg = await vault_ch.send(header)
+        else:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            filename = url.split("/")[-1].split("?")[0] or f"image_{number}.png"
+                            vault_msg = await vault_ch.send(
+                                content=header,
+                                file=discord.File(fp=io.BytesIO(data), filename=filename)
+                            )
+                        else:
+                            embed = discord.Embed(title=f"{label} #{number}", color=discord.Color.blurple())
+                            embed.set_image(url=url)
+                            embed.set_footer(text=f"Saved by {saved_by_str} | Use: {retrieve_cmd}")
+                            vault_msg = await vault_ch.send(content=header, embed=embed)
+            except:
+                embed = discord.Embed(title=f"{label} #{number}", color=discord.Color.blurple())
+                embed.set_image(url=url)
+                embed.set_footer(text=f"Saved by {saved_by_str} | Use: {retrieve_cmd}")
+                vault_msg = await vault_ch.send(content=header, embed=embed)
+
+        self._update_vault_msg_id(db_id, vault_msg.id)
+
+        confirm = discord.Embed(
+            title=f"{emoji} {label} Saved!",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        confirm.add_field(name="Number",        value=f"`#{number}`",      inline=True)
+        confirm.add_field(name="Retrieve with", value=f"`{retrieve_cmd}`", inline=True)
+        confirm.add_field(name="Saved by",      value=ctx.author.mention,  inline=True)
+        if keyword:
+            confirm.add_field(name="Keyword", value=f"`{keyword}`", inline=True)
+        confirm.set_footer(text="Stored in vault")
+        await ctx.send(embed=confirm)
+
+    # ── CORE SEND ────────────────────────────────────────────────────────────
+
+    async def _send_media(self, ctx, media_type: str, number: int):
+        if await self.check_duplicate(ctx):
+            return
+
+        remaining = self._check_media_cooldown(ctx.channel.id, media_type)
+        if remaining > 0:
+            await ctx.send(f"⏳ Please wait `{remaining:.1f}s` before sending another {media_type}.", delete_after=3)
+            return
+
+        row = self._get_entry_by_number(media_type, number)
+        if not row:
+            await ctx.send(f"❌ No {media_type} #{number} found.")
+            return
+
+        db_id, url, saved_by, saved_by_id, saved_at, vault_msg_id, keyword = row
+
+        if media_type == "gif":
+            await ctx.send(url)
+        else:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            filename = url.split("/")[-1].split("?")[0] or f"image_{number}.png"
+                            await ctx.send(file=discord.File(fp=io.BytesIO(data), filename=filename))
+                        else:
+                            await ctx.send(url)
+            except:
+                await ctx.send(url)
+
+        self._set_media_cooldown(ctx.channel.id, media_type)
+
+    # ── CORE DELETE ──────────────────────────────────────────────────────────
+
+    async def _delete_media(self, ctx, media_type: str, number: int):
+        if await self.check_duplicate(ctx):
+            return
+        all_entries = self._get_all_entries(media_type)
+        if not (1 <= number <= len(all_entries)):
+            await ctx.send(f"❌ No {media_type} #{number} found.")
+            return
+
+        target      = all_entries[number - 1]
+        target_id   = target[0]
+        target_url  = target[1]
+        target_by   = target[2]
+        target_vmid = target[5]
+        emoji, label, pfx = self._type_display(media_type)
+
+        vault_ch = await self.get_vault_channel()
+        if vault_ch and target_vmid:
+            try:
+                msg = await vault_ch.fetch_message(int(target_vmid))
+                await msg.delete()
+                if media_type == "gif":
+                    try:
+                        url_msg = await vault_ch.fetch_message(int(target_vmid) - 1)
+                        await url_msg.delete()
+                    except:
+                        pass
+            except Exception as e:
+                print(f"Delete error: {e}")
+
+        self._delete_entry(target_id)
+
+        remaining_entries = self._get_all_entries(media_type)
+        updated = 0
+        if vault_ch:
+            for idx, entry in enumerate(remaining_entries, start=1):
+                old_mid = entry[5]
+                if old_mid:
+                    try:
+                        msg = await vault_ch.fetch_message(int(old_mid))
+                        new_content = f"{emoji} **{label} #{idx}** | Saved by **{entry[2]}** | Use: `!{pfx} {idx}`"
+                        if entry[6]:
+                            new_content += f" | Keyword: `{entry[6]}`"
+                        await msg.edit(content=new_content)
+                        updated += 1
+                        await asyncio.sleep(0.1)
+                    except:
+                        pass
+
+        embed = discord.Embed(
+            title=f"{emoji} {label} Deleted",
+            description=f"Deleted **{label} #{number}**",
+            color=discord.Color.red(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="Saved by", value=target_by,                     inline=True)
+        embed.add_field(name="URL",      value=f"[Click here]({target_url})", inline=True)
+        if updated:
+            embed.add_field(name="Renumbered", value=f"{updated} item(s)", inline=False)
+        embed.set_footer(text=f"Deleted by {ctx.author}")
+        await ctx.send(embed=embed)
+
+    # ── CORE CLEAR ───────────────────────────────────────────────────────────
+
+    async def _clear_all_media(self, ctx, media_type: str):
+        if await self.check_duplicate(ctx):
+            return
+
+        rows = self._get_all_entries(media_type)
+        emoji, label, pfx = self._type_display(media_type)
+        if not rows:
+            await ctx.send(f"❌ No {label.lower()}s saved to clear.")
+            return
+
+        count = len(rows)
+        confirm_msg = await ctx.send(
+            f"⚠️ Are you sure you want to delete **ALL {count} {label.upper()}S**? Reply `yes` to confirm."
+        )
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ['yes', 'no']
+
+        try:
+            response = await self.bot.wait_for('message', timeout=30.0, check=check)
+            if response.content.lower() != 'yes':
+                await ctx.send("✅ Cancelled.")
+                await confirm_msg.delete()
+                await response.delete()
+                return
+            await response.delete()
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Timed out. Nothing deleted.")
+            await confirm_msg.delete()
+            return
+
+        await confirm_msg.delete()
+        msg_ids  = self._delete_all_entries(media_type)
+        vault_ch = await self.get_vault_channel()
+        del_count = 0
+
+        if vault_ch and msg_ids:
+            for msg_id in msg_ids:
+                if msg_id:
+                    try:
+                        msg = await vault_ch.fetch_message(int(msg_id))
+                        await msg.delete()
+                        del_count += 1
+                        if media_type == "gif":
+                            try:
+                                url_msg = await vault_ch.fetch_message(int(msg_id) - 1)
+                                await url_msg.delete()
+                            except:
+                                pass
+                        await asyncio.sleep(0.2)
+                    except:
+                        pass
+
+        embed = discord.Embed(
+            title=f"{emoji} All {label.upper()}S Cleared!",
+            description=f"Deleted **{count}** {label.lower()}s from the vault.",
+            color=discord.Color.red(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="Cleared by",       value=ctx.author.mention, inline=True)
+        embed.add_field(name="Messages deleted", value=str(del_count),     inline=True)
+        await ctx.send(embed=embed)
+
+    # ── CORE LIST ────────────────────────────────────────────────────────────
+
+    async def _list_media(self, ctx, media_type: str):
+        if await self.check_duplicate(ctx):
+            return
+        rows = self._get_all_entries(media_type)
+        emoji, label, pfx = self._type_display(media_type)
+        if not rows:
+            await ctx.send(f"{emoji} No {label.lower()}s saved yet.")
+            return
+        pages = [rows[i:i+10] for i in range(0, len(rows), 10)]
+        for pnum, page in enumerate(pages, 1):
+            embed = discord.Embed(
+                title=f"{emoji} Saved {label}s — Page {pnum}/{len(pages)}",
+                color=discord.Color.blurple(),
+                timestamp=datetime.utcnow()
+            )
+            for idx, (db_id, url, saved_by, saved_by_id, saved_at, vault_msg_id, keyword) in enumerate(page, 1):
+                actual = (pnum - 1) * 10 + idx
+                ts     = datetime.fromtimestamp(saved_at).strftime("%Y-%m-%d")
+                value  = f"Saved by **{saved_by}** on {ts}\n[Link]({url})"
+                if keyword:
+                    value += f"\nKeyword: `{keyword}`"
+                embed.add_field(name=f"#{actual}  |  !{pfx} {actual}", value=value, inline=False)
+            embed.set_footer(text=f"Total {label}s: {len(rows)}")
+            await ctx.send(embed=embed)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MEDIA VAULT COMMANDS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @commands.command(name="save")
+    async def save(self, ctx, *, keyword: str = None):
+        """Save an image or GIF to the vault (staff only).
+        Usage:
+          !save                     — reply to a message with an image/GIF
+          !save https://url         — direct link
+          !save keyword             — reply to media + attach a keyword trigger
+        """
+        if await self.check_duplicate(ctx):
+            return
+        if not self.is_staff(ctx.author):
+            await ctx.send("❌ Only staff can save media.")
+            return
+
+        url_from_arg = None
+        if keyword:
+            parts = keyword.split()
+            for part in parts:
+                if part.startswith("http"):
+                    url_from_arg = part
+                    remaining_kw = ' '.join(p for p in parts if not p.startswith("http")).strip()
+                    keyword = remaining_kw or None
+                    break
+
+        source = ctx.message
+        if ctx.message.reference:
+            try:
+                source = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            except:
+                pass
+
+        url, media_type = await self._extract_media(source)
+
+        if not url and url_from_arg:
+            url = url_from_arg
+            if "giphy.com" in url.lower() or "tenor.com" in url.lower():
+                media_type = "gif"
+            else:
+                media_type = _detect_media_type(url)
+                if media_type == "unknown":
+                    media_type = "image"
+
+        if not url:
+            await ctx.send(
+                "❌ Nothing to save!\n"
+                "• Reply to a message with an image or GIF, then `!save`\n"
+                "• Or: `!save https://link`\n"
+                "• Or with keyword: `!save keyword` while replying to media"
+            )
+            return
+
+        await self._do_save(ctx, url, media_type, keyword)
+
+    # ── Images ────────────────────────────────────────────────────────────────
+
+    @commands.command(name="img")
+    async def img(self, ctx, number: int = None):
+        """Send a saved image by number. !img 3"""
+        if number is None:
+            await ctx.send("❌ Usage: `!img 3`")
+            return
+        await self._send_media(ctx, "image", number)
+
+    @commands.command(name="imgs")
+    async def imgs(self, ctx):
+        """List all saved images."""
+        await self._list_media(ctx, "image")
+
+    @commands.command(name="imgr")
+    async def imgr(self, ctx):
+        """Send a random saved image."""
+        if await self.check_duplicate(ctx):
+            return
+        row = self._get_random_entry("image")
+        if not row:
+            await ctx.send("❌ No images saved yet.")
+            return
+        number = self._get_all_entries("image").index(row) + 1
+        await self._send_media(ctx, "image", number)
+
+    @commands.command(name="delimg")
+    async def delimg(self, ctx, number: int = None):
+        """Delete a saved image by number (owner server only)."""
+        if not self.is_owner_server(ctx):
+            await ctx.send("🔐 Owner server + AsaiyaBot role required.")
+            return
+        if number is None:
+            await ctx.send("❌ Usage: `!delimg 3`")
+            return
+        await self._delete_media(ctx, "image", number)
+
+    @commands.command(name="clearimg")
+    async def clearimg(self, ctx):
+        """Delete ALL saved images (owner server only)."""
+        if not self.is_owner_server(ctx):
+            await ctx.send("🔐 Owner server + AsaiyaBot role required.")
+            return
+        await self._clear_all_media(ctx, "image")
+
+    # ── GIFs ─────────────────────────────────────────────────────────────────
+
+    @commands.command(name="gif")
+    async def gif(self, ctx, number: int = None):
+        """Send a saved GIF by number. !gif 2"""
+        if number is None:
+            await ctx.send("❌ Usage: `!gif 2`")
+            return
+        await self._send_media(ctx, "gif", number)
+
+    @commands.command(name="gifs")
+    async def gifs(self, ctx):
+        """List all saved GIFs."""
+        await self._list_media(ctx, "gif")
+
+    @commands.command(name="gifr")
+    async def gifr(self, ctx):
+        """Send a random saved GIF."""
+        if await self.check_duplicate(ctx):
+            return
+        row = self._get_random_entry("gif")
+        if not row:
+            await ctx.send("❌ No GIFs saved yet.")
+            return
+        number = self._get_all_entries("gif").index(row) + 1
+        await self._send_media(ctx, "gif", number)
+
+    @commands.command(name="delgif")
+    async def delgif(self, ctx, number: int = None):
+        """Delete a saved GIF by number (owner server only)."""
+        if not self.is_owner_server(ctx):
+            await ctx.send("🔐 Owner server + AsaiyaBot role required.")
+            return
+        if number is None:
+            await ctx.send("❌ Usage: `!delgif 3`")
+            return
+        await self._delete_media(ctx, "gif", number)
+
+    @commands.command(name="cleargif")
+    async def cleargif(self, ctx):
+        """Delete ALL saved GIFs (owner server only)."""
+        if not self.is_owner_server(ctx):
+            await ctx.send("🔐 Owner server + AsaiyaBot role required.")
+            return
+        await self._clear_all_media(ctx, "gif")
+
+    # ── Vault Setup ───────────────────────────────────────────────────────────
+
+    @commands.command(name="vaultsetup")
+    @commands.is_owner()
+    async def vaultsetup(self, ctx, channel: discord.TextChannel = None):
+        """(Owner only) Configure the vault storage channel."""
+        if await self.check_duplicate(ctx):
+            return
+        if ctx.guild.id != STORAGE_SERVER_ID:
+            await ctx.send(f"❌ Must be used in the storage server (ID: `{STORAGE_SERVER_ID}`).")
+            return
+        if channel is None:
+            channel = discord.utils.get(ctx.guild.text_channels, name=VAULT_CHANNEL_NAME)
+            if not channel:
+                try:
+                    channel = await ctx.guild.create_text_channel(VAULT_CHANNEL_NAME, reason="Media vault")
+                    await ctx.send(f"✅ Created {channel.mention}.")
+                except Exception as e:
+                    await ctx.send(f"❌ Failed: {e}")
+                    return
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO vault_config (key, value) VALUES ('vault_channel_id', ?)",
+                      (str(channel.id),))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            await ctx.send(f"❌ DB error: {e}")
+            return
+
+        embed = discord.Embed(
+            title="🔒 Media Vault Configured",
+            description=f"All saved media will be stored in {channel.mention}.",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="Channel ID", value=f"`{channel.id}`",   inline=True)
+        embed.add_field(name="Server ID",  value=f"`{ctx.guild.id}`", inline=True)
+        embed.set_footer(text=f"Set by {ctx.author}")
+        await ctx.send(embed=embed)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DETECTOR COMMANDS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @commands.command(name='detect')
+    @commands.has_permissions(administrator=True)
+    async def detect(self, ctx):
+        """Show help for the message detection system."""
+        embed = discord.Embed(
+            title="🔍 Message Detection System",
+            description="Automatically respond to specific messages",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Commands",
+            value=(
+                "`!detect_add` - Add a detection (interactive)\n"
+                "`!detect_multiple` - Add multiple triggers for one response\n"
+                "`!detect_list` - List all active detections\n"
+                "`!detect_remove <trigger>` - Remove a detection\n"
+                "`!detect_stats` - Show detection statistics\n"
+                "`!detect_exempt <id>, <id>` - Exempt channels\n"
+                "`!detect_unexempt <id>, <id>` - Remove exemptions\n"
+                "`!detect_exemptlist` - List exempt channels"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="How it works",
+            value=(
+                "1. Run `!detect_add`\n"
+                "2. Enter the trigger text\n"
+                "3. Enter the response\n\n"
+                "*Triggers are case-insensitive and checked against every message.*"
+            ),
+            inline=False
+        )
+        await ctx.send(embed=embed)
+
+    @commands.command(name='detect_add')
+    @commands.has_permissions(administrator=True)
+    async def detect_add(self, ctx):
+        """Interactively add a single message detection."""
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            await ctx.send(embed=discord.Embed(
+                title="🔍 Add Detection — Step 1/2",
+                description="What message should I detect?\n\n*Case-insensitive. Type `cancel` to cancel.*",
+                color=discord.Color.blue()
+            ))
+            msg1 = await self.bot.wait_for('message', timeout=60.0, check=check)
+            if msg1.content.lower() == 'cancel':
+                await msg1.delete()
+                await ctx.send("❌ Cancelled.")
+                return
+            trigger = msg1.content.strip()
+            await msg1.delete()
+
+            await ctx.send(embed=discord.Embed(
+                title="🔍 Add Detection — Step 2/2",
+                description=f"**Trigger:** `{trigger}`\n\nWhat should I respond with?\n\nType `cancel` to cancel.",
+                color=discord.Color.blue()
+            ))
+            msg2 = await self.bot.wait_for('message', timeout=60.0, check=check)
+            if msg2.content.lower() == 'cancel':
+                await msg2.delete()
+                await ctx.send("❌ Cancelled.")
+                return
+            response = msg2.content.strip()
+            await msg2.delete()
+
+            existing = self._load_detections(ctx.guild.id)
+            if trigger.lower() in existing:
+                await ctx.send(f"⚠️ A detection for `{trigger}` already exists! Remove it first with `!detect_remove {trigger}`.")
+                return
+
+            if self._save_detection(ctx.guild.id, trigger, response, ctx.author.id):
+                await ctx.send(embed=discord.Embed(
+                    title="✅ Detection Added",
+                    description=f"When someone says **{trigger}**, I'll respond:\n> {response}",
+                    color=discord.Color.green()
+                ))
+            else:
+                await ctx.send("❌ Failed to save.")
+
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Timed out.")
+
+    @commands.command(name='detect_multiple')
+    @commands.has_permissions(administrator=True)
+    async def detect_multiple(self, ctx):
+        """Add multiple triggers that all share the same response."""
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        triggers = []
+
+        try:
+            await ctx.send(embed=discord.Embed(
+                title="🔍 Multiple Detections — Step 1/2",
+                description="Enter triggers one at a time.\nType `next` when done, `cancel` to cancel.\n*Case-insensitive*",
+                color=discord.Color.blue()
+            ))
+
+            while True:
+                current = ', '.join(f'`{t}`' for t in triggers) if triggers else "None"
+                await ctx.send(f"**Current triggers ({len(triggers)}):** {current}\n\nEnter a trigger or `next`/`cancel`:")
+                msg = await self.bot.wait_for('message', timeout=60.0, check=check)
+                content = msg.content.strip()
+                await msg.delete()
+
+                if content.lower() == 'cancel':
+                    await ctx.send("❌ Cancelled.")
+                    return
+                elif content.lower() == 'next':
+                    if not triggers:
+                        await ctx.send("⚠️ Add at least one trigger first.")
+                        continue
+                    break
+                else:
+                    if content.lower() in [t.lower() for t in triggers]:
+                        await ctx.send(f"⚠️ `{content}` is already in the list.")
+                        continue
+                    triggers.append(content)
+                    await ctx.send(f"✅ Added `{content}`")
+
+            await ctx.send(embed=discord.Embed(
+                title="🔍 Multiple Detections — Step 2/2",
+                description=f"**Triggers:** {', '.join(f'`{t}`' for t in triggers)}\n\nWhat should I respond with?",
+                color=discord.Color.blue()
+            ))
+            msg2 = await self.bot.wait_for('message', timeout=60.0, check=check)
+            response = msg2.content.strip()
+            await msg2.delete()
+
+            existing = self._load_detections(ctx.guild.id)
+            saved, skipped = 0, 0
+            for trigger in triggers:
+                if trigger.lower() in existing:
+                    skipped += 1
+                    continue
+                if self._save_detection(ctx.guild.id, trigger, response, ctx.author.id):
+                    saved += 1
+
+            await ctx.send(embed=discord.Embed(
+                title="✅ Multiple Detections Added",
+                description=f"**Saved:** {saved} | **Skipped (already exist):** {skipped}\n\n**Response:** {response}",
+                color=discord.Color.green()
+            ))
+
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Timed out.")
+
+    @commands.command(name='detect_list')
+    @commands.has_permissions(administrator=True)
+    async def detect_list(self, ctx):
+        """List all active detections for this server."""
+        detections = self._load_detections(ctx.guild.id)
+        if not detections:
+            await ctx.send("📭 No detections set up for this server.")
+            return
+        embed = discord.Embed(
+            title=f"🔍 Active Detections — {ctx.guild.name}",
+            description=f"**{len(detections)}** detection(s)",
+            color=discord.Color.blue()
+        )
+        for data in list(detections.values())[:25]:
+            creator    = ctx.guild.get_member(data['created_by'])
+            added_by   = creator.display_name if creator else "Unknown"
+            added_date = datetime.fromtimestamp(data['created_at']).strftime("%Y-%m-%d")
+            embed.add_field(
+                name=f"🔹 `{data['original_trigger']}`",
+                value=f"→ {data['response']}\n*Added by {added_by} on {added_date}*",
+                inline=False
+            )
+        await ctx.send(embed=embed)
+
+    @commands.command(name='detect_remove')
+    @commands.has_permissions(administrator=True)
+    async def detect_remove(self, ctx, *, trigger: str):
+        """Remove a detection. Usage: !detect_remove hello"""
+        detections = self._load_detections(ctx.guild.id)
+        trigger_lower = trigger.lower()
+        if trigger_lower not in detections:
+            await ctx.send(f"❌ `{trigger}` not found. Use `!detect_list` to see all.")
+            return
+        original = detections[trigger_lower]['original_trigger']
+        if self._delete_detection(ctx.guild.id, original):
+            await ctx.send(f"✅ Removed detection for `{original}`.")
+        else:
+            await ctx.send("❌ Failed to remove.")
+
+    @commands.command(name='detect_stats')
+    @commands.has_permissions(administrator=True)
+    async def detect_stats(self, ctx):
+        """Show how many times each detection has been triggered."""
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM detection_logs WHERE guild_id = ?", (str(ctx.guild.id),))
+            total = c.fetchone()[0]
+            c.execute(
+                '''SELECT trigger_text, COUNT(*) FROM detection_logs
+                   WHERE guild_id = ? GROUP BY trigger_text ORDER BY COUNT(*) DESC LIMIT 10''',
+                (str(ctx.guild.id),)
+            )
+            top = c.fetchall()
+            conn.close()
+            embed = discord.Embed(title="📊 Detection Statistics", color=discord.Color.blue())
+            embed.add_field(name="Total Triggers",    value=str(total), inline=True)
+            embed.add_field(name="Active Detections", value=str(len(self._load_detections(ctx.guild.id))), inline=True)
+            if top:
+                text = "\n".join(f"• `{t}`: {cnt}" for t, cnt in top)
+                embed.add_field(name="Most Triggered", value=text, inline=False)
+            await ctx.send(embed=embed)
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+
+    @commands.command(name='detect_exempt')
+    @commands.has_permissions(administrator=True)
+    async def detect_exempt(self, ctx, *, args: str):
+        """Exempt channels from detection. Usage: !detect_exempt #channel, #other"""
+        raw_entries = [e.strip() for e in args.split(',')]
+        added, already, invalid = [], [], []
+        for entry in raw_entries:
+            clean = entry.strip('<>#')
+            try:
+                channel_id = int(clean)
+            except ValueError:
+                invalid.append(entry); continue
+            channel = ctx.guild.get_channel(channel_id)
+            if not channel:
+                invalid.append(entry); continue
+            existing = self._load_exemptions(ctx.guild.id)
+            if channel_id in existing:
+                already.append(channel.mention)
+            elif self._save_exemption(ctx.guild.id, channel_id, ctx.author.id):
+                added.append(channel.mention)
+            else:
+                invalid.append(entry)
+        lines = []
+        if added:   lines.append(f"✅ **Exempted:** {', '.join(added)}")
+        if already: lines.append(f"⚠️ **Already exempt:** {', '.join(already)}")
+        if invalid: lines.append(f"❌ **Not found:** {', '.join(invalid)}")
+        await ctx.send(embed=discord.Embed(
+            title="🚫 Channel Exemptions Updated",
+            description="\n".join(lines) or "Nothing changed.",
+            color=discord.Color.orange()
+        ))
+
+    @commands.command(name='detect_unexempt')
+    @commands.has_permissions(administrator=True)
+    async def detect_unexempt(self, ctx, *, args: str):
+        """Remove channel exemptions. Usage: !detect_unexempt #channel"""
+        raw_entries = [e.strip() for e in args.split(',')]
+        removed, not_exempt, invalid = [], [], []
+        for entry in raw_entries:
+            clean = entry.strip('<>#')
+            try:
+                channel_id = int(clean)
+            except ValueError:
+                invalid.append(entry); continue
+            channel = ctx.guild.get_channel(channel_id)
+            if not channel:
+                invalid.append(entry); continue
+            existing = self._load_exemptions(ctx.guild.id)
+            if channel_id not in existing:
+                not_exempt.append(channel.mention)
+            elif self._delete_exemption(ctx.guild.id, channel_id):
+                removed.append(channel.mention)
+            else:
+                invalid.append(entry)
+        lines = []
+        if removed:    lines.append(f"✅ **Unexempted:** {', '.join(removed)}")
+        if not_exempt: lines.append(f"⚠️ **Wasn't exempt:** {', '.join(not_exempt)}")
+        if invalid:    lines.append(f"❌ **Not found:** {', '.join(invalid)}")
+        await ctx.send(embed=discord.Embed(
+            title="✅ Channel Exemptions Updated",
+            description="\n".join(lines) or "Nothing changed.",
+            color=discord.Color.green()
+        ))
+
+    @commands.command(name='detect_exemptlist')
+    @commands.has_permissions(administrator=True)
+    async def detect_exemptlist(self, ctx):
+        """List all channels exempt from detection."""
+        guild_exempts = self._load_exemptions(ctx.guild.id)
+        if not guild_exempts:
+            await ctx.send("📭 No exempt channels.")
+            return
+        mentions = []
+        for channel_id in guild_exempts:
+            ch = ctx.guild.get_channel(channel_id)
+            mentions.append(ch.mention if ch else f"`{channel_id}` *(deleted?)*")
+        embed = discord.Embed(
+            title="🚫 Exempt Channels",
+            description="\n".join(mentions),
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text=f"{len(mentions)} channel(s) exempt")
+        await ctx.send(embed=embed)
+
+
+async def setup(bot):
+    await bot.add_cog(AbsoluteDetect(bot))

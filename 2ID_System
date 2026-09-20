@@ -1,0 +1,1240 @@
+import discord
+from discord.ext import commands
+import sqlite3
+import time
+import asyncio
+import os
+from datetime import datetime
+
+# ===== CONFIGURATION =====
+DB_FOLDER = r"C:\Users\Kelly\Desktop\discord database"
+MAIN_DB_PATH = os.path.join(DB_FOLDER, "asaiya_bot.db")
+
+BOT_ROLE = "AsaiyaBot"
+VERIFY_CHANNEL_NAME = "asaiya-verification"
+
+# MLBB Server ID - !id command won't work here
+MLBB_SERVER_ID = 1485978412219891834
+
+
+class IDSystem(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        # Track users currently in ID setup
+        self.pending_setup = {}  # {user_id: {"guild_id": int, "step": int, "answers": dict}}
+        self.pending_server_setup = {}  # {user_id: {"guild_id": int, "step": int, "answers": dict}}
+        self.pending_channel_setup = {}  # {user_id: {"channel_id": int, "step": int, "answers": dict}}
+        # Track processed commands
+        self.processed_commands = {}
+        # Track global profile user (only one)
+        self.global_user_id = self.load_global_user()
+        
+        # Ensure database tables exist
+        self.setup_database()
+        
+        print(f"✅ ID System cog initialized (ID: {id(self)})")
+
+    # ===== DUPLICATE PREVENTION =====
+    async def check_duplicate(self, ctx):
+        """Check if this command was already processed"""
+        key = f"{ctx.author.id}:{ctx.command.name}"
+        current_time = time.time()
+        
+        if key in self.processed_commands:
+            if current_time - self.processed_commands[key] < 3:
+                print(f"⚠️ Prevented dual execution: {ctx.command.name} by {ctx.author} in {ctx.guild.name}")
+                return True
+        
+        self.processed_commands[key] = current_time
+        
+        if len(self.processed_commands) > 100:
+            to_delete = [k for k, t in self.processed_commands.items() if current_time - t > 10]
+            for k in to_delete:
+                del self.processed_commands[k]
+        
+        return False
+
+    # ===== DATABASE HELPERS =====
+    def get_server_db_path(self, guild_id):
+        """Get database path for a specific server"""
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT db_path FROM authorized_servers WHERE guild_id = ?", (str(guild_id),))
+            result = c.fetchone()
+            
+            if not result:
+                c.execute("SELECT db_path FROM servers WHERE guild_id = ?", (str(guild_id),))
+                result = c.fetchone()
+            
+            conn.close()
+            
+            if result and result[0]:
+                return result[0]
+            return None
+        except Exception as e:
+            print(f"Error getting server db path for {guild_id}: {e}")
+            return None
+
+    def get_cached_connection(self, guild_id):
+        """Get cached database connection with proper error handling"""
+        current_time = time.time()
+
+        # Clean up old connections
+        if hasattr(self.bot, 'db_connections') and len(self.bot.db_connections) > 10:
+            for gid, last_used in list(self.bot.last_db_use.items()):
+                if current_time - last_used > 300:
+                    try:
+                        if gid in self.bot.db_connections:
+                            self.bot.db_connections[gid].close()
+                            del self.bot.db_connections[gid]
+                        del self.bot.last_db_use[gid]
+                    except:
+                        pass
+
+        # Check existing connection
+        if hasattr(self.bot, 'db_connections') and guild_id in self.bot.db_connections:
+            try:
+                self.bot.db_connections[guild_id].execute("SELECT 1")
+                if hasattr(self.bot, 'last_db_use'):
+                    self.bot.last_db_use[guild_id] = current_time
+                return self.bot.db_connections[guild_id]
+            except:
+                try:
+                    self.bot.db_connections[guild_id].close()
+                except:
+                    pass
+                if guild_id in self.bot.db_connections:
+                    del self.bot.db_connections[guild_id]
+
+        # Get database path
+        db_path = self.get_server_db_path(guild_id)
+        if not db_path or not os.path.exists(db_path):
+            print(f"❌ No valid db_path for guild {guild_id}")
+            return None
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        
+        if not hasattr(self.bot, 'db_connections'):
+            self.bot.db_connections = {}
+        if not hasattr(self.bot, 'last_db_use'):
+            self.bot.last_db_use = {}
+            
+        self.bot.db_connections[guild_id] = conn
+        self.bot.last_db_use[guild_id] = current_time
+        
+        # Ensure tables exist on connection
+        self.ensure_server_tables(guild_id)
+        
+        return conn
+
+    # ===== DATABASE SETUP =====
+    def setup_database(self):
+        """Create necessary tables in main database"""
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            
+            # Track global profile user
+            c.execute('''CREATE TABLE IF NOT EXISTS global_profile
+                         (user_id TEXT PRIMARY KEY,
+                          display_name TEXT,
+                          join_reason TEXT,
+                          likes TEXT,
+                          created_at REAL,
+                          updated_at REAL)''')
+            
+            conn.commit()
+            conn.close()
+            print("✅ ID System database initialized")
+        except Exception as e:
+            print(f"❌ Error setting up ID database: {e}")
+
+    def ensure_server_tables(self, guild_id):
+        """Ensure server database has all profile tables"""
+        try:
+            conn = self.get_cached_connection(guild_id)
+            if not conn:
+                print(f"❌ ensure_server_tables: No connection for guild {guild_id}")
+                return False
+            
+            c = conn.cursor()
+            
+            # User profiles
+            c.execute('''CREATE TABLE IF NOT EXISTS user_profiles
+                         (user_id TEXT PRIMARY KEY,
+                          server_number INTEGER,
+                          display_name TEXT,
+                          join_reason TEXT,
+                          likes TEXT,
+                          verified_at REAL,
+                          created_at REAL,
+                          updated_at REAL)''')
+            
+            # Server profile (only one per server)
+            c.execute('''CREATE TABLE IF NOT EXISTS server_profile
+                         (guild_id TEXT PRIMARY KEY,
+                          display_name TEXT,
+                          description TEXT,
+                          created_at REAL,
+                          updated_at REAL,
+                          created_by TEXT)''')
+            
+            # Channel profiles (one per channel)
+            c.execute('''CREATE TABLE IF NOT EXISTS channel_profiles
+                         (channel_id TEXT PRIMARY KEY,
+                          display_name TEXT,
+                          description TEXT,
+                          created_at REAL,
+                          updated_at REAL,
+                          created_by TEXT)''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS server_members
+                         (user_id TEXT PRIMARY KEY,
+                          join_order INTEGER,
+                          joined_at REAL)''')
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error ensuring server tables for {guild_id}: {e}")
+            return False
+
+    def table_exists(self, guild_id, table_name):
+        """Check if a table exists in the server database"""
+        try:
+            conn = self.get_cached_connection(guild_id)
+            if not conn:
+                return False
+            c = conn.cursor()
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            return c.fetchone() is not None
+        except:
+            return False
+
+    def get_server_number(self, guild_id, user_id):
+        """Get or create server number for user (based on join order)"""
+        try:
+            conn = self.get_cached_connection(guild_id)
+            if not conn:
+                return None
+            
+            c = conn.cursor()
+            
+            # Check if user already has a number
+            c.execute("SELECT server_number FROM user_profiles WHERE user_id = ?", (str(user_id),))
+            result = c.fetchone()
+            if result:
+                return result[0]
+            
+            # Get the next available number
+            c.execute("SELECT MAX(server_number) FROM user_profiles")
+            result = c.fetchone()
+            next_number = (result[0] or 0) + 1
+            
+            return next_number
+        except Exception as e:
+            print(f"Error getting server number: {e}")
+            return None
+
+    def load_global_user(self):
+        """Load the global profile user from database"""
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM global_profile LIMIT 1")
+            result = c.fetchone()
+            conn.close()
+            return int(result[0]) if result else None
+        except:
+            return None
+
+    def get_global_profile(self, user_id):
+        """Get global profile data for a user"""
+        try:
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT display_name, join_reason, likes FROM global_profile WHERE user_id = ?", (str(user_id),))
+            result = c.fetchone()
+            conn.close()
+            return result if result else None
+        except:
+            return None
+
+    # ===== ID SETUP FLOW (Called after verification) =====
+    async def start_id_setup(self, user, guild):
+        """Start the ID setup process for a newly verified user"""
+        # Ensure tables exist first
+        self.ensure_server_tables(guild.id)
+        
+        # Check if user already has a profile in this server
+        conn = self.get_cached_connection(guild.id)
+        if conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (str(user.id),))
+            if c.fetchone():
+                return  # User already has profile
+        
+        # Initialize setup tracking
+        self.pending_setup[user.id] = {
+            "guild_id": guild.id,
+            "step": 1,
+            "answers": {}
+        }
+        
+        # Send first question
+        try:
+            embed = discord.Embed(
+                title="📝 Create Your Server ID Card",
+                description="Let's set up your ID card for this server! Answer these questions:",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Question 1/3", value="**Who are you?**\n*(This can be your name, nickname, or how you want to be known)*", inline=False)
+            await user.send(embed=embed)
+        except discord.Forbidden:
+            print(f"❌ Cannot DM {user.name} for ID setup")
+
+    # ===== LISTENERS =====
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Handle ID setup responses in DMs"""
+        if message.author.bot or not isinstance(message.channel, discord.DMChannel):
+            return
+        
+        user_id = message.author.id
+        
+        # Check for user profile setup
+        if user_id in self.pending_setup:
+            await self.handle_user_setup(message)
+            return
+        
+        # Check for server profile setup
+        if user_id in self.pending_server_setup:
+            await self.handle_server_setup(message)
+            return
+        
+        # Check for channel profile setup
+        if user_id in self.pending_channel_setup:
+            await self.handle_channel_setup(message)
+            return
+
+    async def handle_user_setup(self, message):
+        """Handle user profile setup steps"""
+        user_id = message.author.id
+        setup_data = self.pending_setup[user_id]
+        guild = self.bot.get_guild(setup_data["guild_id"])
+        
+        if not guild:
+            del self.pending_setup[user_id]
+            return
+        
+        if setup_data["step"] == 1:
+            # Save answer to question 1
+            setup_data["answers"]["display_name"] = message.content[:100]
+            setup_data["step"] = 2
+            
+            embed = discord.Embed(
+                title="📝 Question 2/3",
+                description="**What do you want others to know about you?**",
+                color=discord.Color.blue()
+            )
+            await message.channel.send(embed=embed)
+            
+        elif setup_data["step"] == 2:
+            # Save answer to question 2
+            setup_data["answers"]["join_reason"] = message.content[:200]
+            setup_data["step"] = 3
+            
+            embed = discord.Embed(
+                title="📝 Question 3/3",
+                description="**What do you like?**\n*(Hobbies, interests, etc.)*",
+                color=discord.Color.blue()
+            )
+            await message.channel.send(embed=embed)
+            
+        elif setup_data["step"] == 3:
+            # Save final answer and create profile
+            setup_data["answers"]["likes"] = message.content[:200]
+
+            # Ensure tables exist before saving
+            self.ensure_server_tables(guild.id)
+
+            # Get database connection
+            conn = self.get_cached_connection(guild.id)
+            if not conn:
+                await message.channel.send(
+                    f"❌ Could not connect to the database for **{guild.name}**.\n"
+                    f"Your answers were received but could not be saved.\n"
+                    f"Please ask a server admin to check the bot's database configuration for this server."
+                )
+                print(f"❌ handle_user_setup: conn is None for guild {guild.id} ({guild.name}), user {user_id}")
+                del self.pending_setup[user_id]
+                return
+
+            # Get server number
+            server_number = self.get_server_number(guild.id, user_id)
+            if server_number is None:
+                await message.channel.send(
+                    f"❌ Could not assign a server number for **{guild.name}**.\n"
+                    f"Please ask a server admin to check the bot's database configuration."
+                )
+                del self.pending_setup[user_id]
+                return
+
+            # Save to database
+            try:
+                c = conn.cursor()
+                c.execute('''INSERT OR REPLACE INTO user_profiles
+                             (user_id, server_number, display_name, join_reason, likes, verified_at, created_at, updated_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (str(user_id), server_number,
+                           setup_data["answers"]["display_name"],
+                           setup_data["answers"]["join_reason"],
+                           setup_data["answers"]["likes"],
+                           time.time(), time.time(), time.time()))
+                conn.commit()
+
+                print(f"✅ Profile saved for user {user_id} in guild {guild.id} ({guild.name}), server_number={server_number}")
+
+                # Show completed profile
+                embed = discord.Embed(
+                    title="✅ ID Card Created!",
+                    description=f"Your server ID card for **{guild.name}** has been created!",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="Server ID #", value=f"`{server_number}`", inline=True)
+                embed.add_field(name="Display Name", value=setup_data["answers"]["display_name"], inline=True)
+                embed.add_field(name="Join Reason", value=setup_data["answers"]["join_reason"], inline=False)
+                embed.add_field(name="Likes", value=setup_data["answers"]["likes"], inline=False)
+                
+                if guild.icon:
+                    embed.set_thumbnail(url=guild.icon.url)
+                
+                await message.channel.send(embed=embed)
+                
+                # Log to server
+                log_channel = await self.get_log_channel(guild)
+                if log_channel:
+                    await log_channel.send(f"📝 {message.author.mention} created their ID card (Server ID #{server_number})")
+
+            except Exception as e:
+                await message.channel.send(f"❌ Error saving your profile: {e}")
+                print(f"❌ Error saving profile for {user_id} in guild {guild.id}: {e}")
+            
+            # Clean up
+            del self.pending_setup[user_id]
+
+    async def handle_server_setup(self, message):
+        """Handle server profile setup steps"""
+        user_id = message.author.id
+        setup_data = self.pending_server_setup[user_id]
+        guild = self.bot.get_guild(setup_data["guild_id"])
+        
+        if not guild:
+            del self.pending_server_setup[user_id]
+            return
+        
+        if setup_data["step"] == 1:
+            # Save server name
+            answer = message.content.strip()
+            if answer.lower() == "same":
+                setup_data["answers"]["display_name"] = guild.name
+            else:
+                setup_data["answers"]["display_name"] = answer[:100]
+            
+            setup_data["step"] = 2
+            
+            embed = discord.Embed(
+                title="📝 Server Profile - Question 2/2",
+                description="**What is this server about?**\n*(Describe the purpose of this server)*",
+                color=discord.Color.blue()
+            )
+            await message.channel.send(embed=embed)
+            
+        elif setup_data["step"] == 2:
+            # Save server description and create profile
+            setup_data["answers"]["description"] = message.content[:200]
+            
+            # Save to database
+            try:
+                conn = self.get_cached_connection(guild.id)
+                if conn:
+                    c = conn.cursor()
+                    c.execute('''INSERT OR REPLACE INTO server_profile
+                                 (guild_id, display_name, description, created_at, updated_at, created_by)
+                                 VALUES (?, ?, ?, ?, ?, ?)''',
+                              (str(guild.id),
+                               setup_data["answers"]["display_name"],
+                               setup_data["answers"]["description"],
+                               time.time(), time.time(),
+                               str(message.author.id)))
+                    conn.commit()
+                    
+                    # Show completed profile
+                    embed = discord.Embed(
+                        title="✅ Server Profile Created!",
+                        description=f"Profile for **{guild.name}** has been saved!",
+                        color=discord.Color.green()
+                    )
+                    embed.add_field(name="Display Name", value=setup_data["answers"]["display_name"], inline=True)
+                    embed.add_field(name="Description", value=setup_data["answers"]["description"], inline=False)
+                    embed.add_field(name="Server ID", value=f"`{guild.id}`", inline=True)
+                    
+                    if guild.icon:
+                        embed.set_thumbnail(url=guild.icon.url)
+                    if guild.banner:
+                        embed.set_image(url=guild.banner.url)
+                    
+                    await message.channel.send(embed=embed)
+                else:
+                    await message.channel.send(f"❌ Could not connect to the database for **{guild.name}**.")
+                    
+            except Exception as e:
+                await message.channel.send(f"❌ Error saving server profile: {e}")
+            
+            # Clean up
+            del self.pending_server_setup[user_id]
+
+    async def handle_channel_setup(self, message):
+        """Handle channel profile setup steps"""
+        user_id = message.author.id
+        setup_data = self.pending_channel_setup[user_id]
+        guild = self.bot.get_guild(setup_data["guild_id"])
+        channel = guild.get_channel(setup_data["channel_id"]) if guild else None
+        
+        if not guild or not channel:
+            del self.pending_channel_setup[user_id]
+            return
+        
+        if setup_data["step"] == 1:
+            # Save channel name
+            answer = message.content.strip()
+            if answer.lower() == "same":
+                setup_data["answers"]["display_name"] = channel.name
+            else:
+                setup_data["answers"]["display_name"] = answer[:100]
+            
+            setup_data["step"] = 2
+            
+            embed = discord.Embed(
+                title="📝 Channel Profile - Question 2/2",
+                description="**What is this channel about?**\n*(Describe the purpose of this channel)*",
+                color=discord.Color.blue()
+            )
+            await message.channel.send(embed=embed)
+            
+        elif setup_data["step"] == 2:
+            # Save channel description and create profile
+            setup_data["answers"]["description"] = message.content[:200]
+            
+            # Save to database
+            try:
+                conn = self.get_cached_connection(guild.id)
+                if conn:
+                    c = conn.cursor()
+                    c.execute('''INSERT OR REPLACE INTO channel_profiles
+                                 (channel_id, display_name, description, created_at, updated_at, created_by)
+                                 VALUES (?, ?, ?, ?, ?, ?)''',
+                              (str(channel.id),
+                               setup_data["answers"]["display_name"],
+                               setup_data["answers"]["description"],
+                               time.time(), time.time(),
+                               str(message.author.id)))
+                    conn.commit()
+                    
+                    # Show completed profile
+                    embed = discord.Embed(
+                        title="✅ Channel Profile Created!",
+                        description=f"Profile for **#{channel.name}** has been saved!",
+                        color=discord.Color.green()
+                    )
+                    embed.add_field(name="Display Name", value=setup_data["answers"]["display_name"], inline=True)
+                    embed.add_field(name="Description", value=setup_data["answers"]["description"], inline=False)
+                    embed.add_field(name="Channel ID", value=f"`{channel.id}`", inline=True)
+                    
+                    await message.channel.send(embed=embed)
+                else:
+                    await message.channel.send(f"❌ Could not connect to the database for **#{channel.name}**.")
+                    
+            except Exception as e:
+                await message.channel.send(f"❌ Error saving channel profile: {e}")
+            
+            # Clean up
+            del self.pending_channel_setup[user_id]
+
+    async def get_log_channel(self, guild):
+        """Get the log channel for a guild"""
+        try:
+            conn = self.get_cached_connection(guild.id)
+            if not conn:
+                return None
+            c = conn.cursor()
+            c.execute("SELECT log_channel_id FROM log_channels")
+            result = c.fetchone()
+            if result and result[0]:
+                return guild.get_channel(int(result[0]))
+        except:
+            pass
+        return None
+
+    # ===== COMMANDS =====
+
+    @commands.command(name='idset_users')
+    @commands.has_permissions(administrator=True)
+    async def idset_users(self, ctx):
+        """DM all unregistered users to set up their ID profiles"""
+        if await self.check_duplicate(ctx):
+            return
+        
+        # Check for AsaiyaBot role
+        has_bot_role = any(role.name == BOT_ROLE for role in ctx.author.roles)
+        if not has_bot_role:
+            await ctx.send(f"❌ You need the {BOT_ROLE} role to use this command.")
+            return
+        
+        # Ensure tables exist
+        self.ensure_server_tables(ctx.guild.id)
+        
+        status_msg = await ctx.send("📨 Scanning for users without ID profiles...")
+        
+        # Get all members without profiles
+        conn = self.get_cached_connection(ctx.guild.id)
+        if not conn:
+            await status_msg.edit(content="❌ Could not connect to database.")
+            return
+        
+        c = conn.cursor()
+        
+        # Get users who already have profiles
+        c.execute("SELECT user_id FROM user_profiles")
+        profiled_users = [row[0] for row in c.fetchall()]
+        
+        # Find members without profiles
+        members_to_dm = []
+        for member in ctx.guild.members:
+            if member.bot:
+                continue
+            if str(member.id) not in profiled_users:
+                members_to_dm.append(member)
+        
+        if not members_to_dm:
+            await status_msg.edit(content="✅ All members already have ID profiles!")
+            return
+        
+        await status_msg.edit(content=f"📨 Sending ID setup DMs to {len(members_to_dm)} members...")
+        
+        # Send DMs
+        success = 0
+        failed = 0
+        
+        for member in members_to_dm:
+            try:
+                embed = discord.Embed(
+                    title="📝 Create Your Server ID Card",
+                    description=(
+                        f"Hello! The staff of **{ctx.guild.name}** would like you to create your server ID card.\n\n"
+                        f"This helps everyone get to know each other better!"
+                    ),
+                    color=discord.Color.blue()
+                )
+                embed.add_field(name="What is this?", 
+                              value="You'll answer 3 simple questions to create your profile.", 
+                              inline=False)
+                embed.add_field(name="Questions", 
+                              value="1. Who are you?\n2. What do you want others to know about you?\n3. What do you like?", 
+                              inline=False)
+                
+                await member.send(embed=embed)
+                
+                # Initialize setup for this user
+                self.pending_setup[member.id] = {
+                    "guild_id": ctx.guild.id,
+                    "step": 1,
+                    "answers": {}
+                }
+                
+                # Send first question
+                q_embed = discord.Embed(
+                    title="📝 Question 1/3",
+                    description="**Who are you?**\n*(This can be your name, nickname, or how you want to be known)*",
+                    color=discord.Color.blue()
+                )
+                await member.send(embed=q_embed)
+                
+                success += 1
+                await asyncio.sleep(1)  # Rate limiting
+                
+            except discord.Forbidden:
+                failed += 1
+                print(f"❌ Cannot DM {member.name}")
+            except Exception as e:
+                failed += 1
+                print(f"Error DMing {member.name}: {e}")
+        
+        await status_msg.delete()
+        
+        embed = discord.Embed(
+            title="📨 ID Setup Complete",
+            description=f"**Success:** {success} DM(s) sent\n**Failed:** {failed} user(s) (DMs disabled)",
+            color=discord.Color.green() if failed == 0 else discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
+
+    @commands.command(name='idset_server')
+    @commands.has_permissions(administrator=True)
+    async def idset_server(self, ctx):
+        """Set up server profile"""
+        if await self.check_duplicate(ctx):
+            return
+        
+        # Check for AsaiyaBot role
+        has_bot_role = any(role.name == BOT_ROLE for role in ctx.author.roles)
+        if not has_bot_role:
+            await ctx.send(f"❌ You need the {BOT_ROLE} role to use this command.")
+            return
+        
+        # Ensure server tables exist
+        self.ensure_server_tables(ctx.guild.id)
+        
+        # Check if server profile already exists
+        conn = self.get_cached_connection(ctx.guild.id)
+        if conn:
+            c = conn.cursor()
+            c.execute("SELECT display_name FROM server_profile WHERE guild_id = ?", (str(ctx.guild.id),))
+            existing = c.fetchone()
+            if existing:
+                await ctx.send("⚠️ This server already has a profile. Using this command will overwrite it.")
+        
+        # Start setup in DMs
+        try:
+            embed = discord.Embed(
+                title="📝 Create Server Profile",
+                description="Let's set up a profile for this server!",
+                color=discord.Color.blue()
+            )
+            await ctx.author.send(embed=embed)
+            
+            # Initialize setup
+            self.pending_server_setup[ctx.author.id] = {
+                "guild_id": ctx.guild.id,
+                "step": 1,
+                "answers": {}
+            }
+            
+            # Send first question
+            q_embed = discord.Embed(
+                title="📝 Question 1/2",
+                description="**What do you want the name of this server to be saved as?**\n*(Type `same` to use the current server name)*",
+                color=discord.Color.blue()
+            )
+            await ctx.author.send(embed=q_embed)
+            
+            await ctx.send("📨 Check your DMs to continue setting up the server profile!")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ I couldn't DM you. Please enable DMs and try again.")
+
+    @commands.command(name='idset_channel')
+    @commands.has_permissions(administrator=True)
+    async def idset_channel(self, ctx):
+        """Set up profile for the current channel"""
+        if await self.check_duplicate(ctx):
+            return
+        
+        # Check for AsaiyaBot role
+        has_bot_role = any(role.name == BOT_ROLE for role in ctx.author.roles)
+        if not has_bot_role:
+            await ctx.send(f"❌ You need the {BOT_ROLE} role to use this command.")
+            return
+        
+        # Ensure server tables exist
+        self.ensure_server_tables(ctx.guild.id)
+        
+        # Check if channel profile already exists
+        conn = self.get_cached_connection(ctx.guild.id)
+        if conn:
+            c = conn.cursor()
+            c.execute("SELECT display_name FROM channel_profiles WHERE channel_id = ?", (str(ctx.channel.id),))
+            existing = c.fetchone()
+            if existing:
+                await ctx.send("⚠️ This channel already has a profile. Using this command will overwrite it.")
+        
+        # Start setup in DMs
+        try:
+            embed = discord.Embed(
+                title="📝 Create Channel Profile",
+                description=f"Let's set up a profile for #{ctx.channel.name}!",
+                color=discord.Color.blue()
+            )
+            await ctx.author.send(embed=embed)
+            
+            # Initialize setup
+            self.pending_channel_setup[ctx.author.id] = {
+                "guild_id": ctx.guild.id,
+                "channel_id": ctx.channel.id,
+                "step": 1,
+                "answers": {}
+            }
+            
+            # Send first question
+            q_embed = discord.Embed(
+                title="📝 Question 1/2",
+                description="**What do you want this channel's name to be saved as?**\n*(Type `same` to use the current channel name)*",
+                color=discord.Color.blue()
+            )
+            await ctx.author.send(embed=q_embed)
+            
+            await ctx.send("📨 Check your DMs to continue setting up the channel profile!")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ I couldn't DM you. Please enable DMs and try again.")
+
+    @commands.command(name='id')
+    async def id_command(self, ctx, *, target: str = None):
+        """Get IDs or view profiles of users, server, or channel.
+        Usage: !id @user | !id username | !id server | !id channel | !id profile @user
+        
+        ⚠️ This command does NOT work in the MLBB server. Use !mlid instead.
+        """
+        if await self.check_duplicate(ctx):
+            return
+        
+        # Disable on MLBB server
+        if ctx.guild and ctx.guild.id == MLBB_SERVER_ID:
+            await ctx.send("❌ The `!id` command is disabled in the MLBB server. Please use `!mlid` instead.")
+            return
+        
+        # Delete the command message
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+            
+        # If no target provided, show help
+        if target is None:
+            embed = discord.Embed(
+                title="🆔 ID Command Help",
+                description="Get IDs or view profiles.",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Basic ID Commands", 
+                          value="`!id @user` - Get user's Discord ID or profile\n`!id username` - Get user ID by name\n`!id server` - Get server ID or profile\n`!id channel` - Get channel ID or profile", 
+                          inline=False)
+            embed.add_field(name="Profile Commands", 
+                          value="`!id profile @user` - View user's ID profile\n`!id profile` - View your own profile", 
+                          inline=False)
+            embed.add_field(name="Global Profile", 
+                          value="`!gid @user` - View a user's global profile (if they are the global user)", 
+                          inline=False)
+            await ctx.send(embed=embed)
+            return
+        
+        # Check for profile view
+        if target.lower().startswith('profile'):
+            parts = target.split()
+            if len(parts) > 1 and len(ctx.message.mentions) > 0:
+                user = ctx.message.mentions[0]
+            else:
+                user = ctx.author
+            
+            await self.show_profile(ctx, user)
+            return
+        
+        # Check for server profile or ID
+        if target.lower() == 'server':
+            # Try to show server profile first
+            if await self.show_server_profile(ctx):
+                return
+            # Fall back to simple message
+            await ctx.send(f"❌ This server does not have a profile.\nBut its Discord ID is: `{ctx.guild.id}`")
+            return
+        
+        # Check for channel profile or ID
+        if target.lower() == 'channel':
+            # Try to show channel profile first
+            if await self.show_channel_profile(ctx, ctx.channel):
+                return
+            # Fall back to simple message
+            await ctx.send(f"❌ This channel does not have a profile.\nBut its Discord ID is: `{ctx.channel.id}`")
+            return
+        
+        # Try to get user by mention or name
+        try:
+            user = None
+            
+            # Check if it's a mention
+            if len(ctx.message.mentions) > 0:
+                user = ctx.message.mentions[0]
+            else:
+                # Try to find user by exact name or nickname first
+                target_lower = target.lower()
+                for member in ctx.guild.members:
+                    if member.name.lower() == target_lower:
+                        user = member
+                        break
+                    if member.nick and member.nick.lower() == target_lower:
+                        user = member
+                        break
+                
+                # If not found, try partial match
+                if not user:
+                    for member in ctx.guild.members:
+                        if target_lower in member.name.lower():
+                            user = member
+                            break
+                        if member.nick and target_lower in member.nick.lower():
+                            user = member
+                            break
+            
+            if user:
+                await self.show_profile(ctx, user)
+            else:
+                await ctx.send(f"❌ Could not find user `{target}`")
+                
+        except Exception as e:
+            await ctx.send(f"❌ Error: {str(e)}")
+
+    @commands.command(name='gid')
+    async def global_id(self, ctx, *, target: str = None):
+        """View a user's global profile (if they are the global user).
+        Usage: !gid @user | !gid username | !gid
+        """
+        if await self.check_duplicate(ctx):
+            return
+        
+        # Delete the command message
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+        
+        # Determine target user
+        user = None
+        if target:
+            # Check if it's a mention
+            if len(ctx.message.mentions) > 0:
+                user = ctx.message.mentions[0]
+            else:
+                # Try to find user by name
+                target_lower = target.lower()
+                for member in ctx.guild.members:
+                    if member.name.lower() == target_lower:
+                        user = member
+                        break
+                    if member.nick and member.nick.lower() == target_lower:
+                        user = member
+                        break
+        else:
+            user = ctx.author
+        
+        if not user:
+            await ctx.send(f"❌ Could not find user `{target}`")
+            return
+        
+        
+        if self.global_user_id != user.id:
+            await ctx.send(f"❌ {user.mention} does not have a global profile. Only ONE person can be the global user.")
+            return
+        
+        
+        profile = self.get_global_profile(user.id)
+        if not profile:
+            await ctx.send(f"❌ {user.mention} does not have a global profile saved.")
+            return
+        
+        display_name, join_reason, likes = profile
+        
+        embed = discord.Embed(
+            title=f"🌍 Global Profile: {user.name}",
+            color=discord.Color.gold()
+        )
+        embed.set_thumbnail(url=user.avatar.url if user.avatar else user.default_avatar.url)
+        
+        embed.add_field(name="Display Name:", value=display_name, inline=True)
+        embed.add_field(name="About Me:", value=join_reason, inline=False)
+        embed.add_field(name="Likes:", value=likes, inline=False)
+        embed.set_footer(text="🌍 This profile appears across all servers")
+        
+        await ctx.send(embed=embed)
+
+    async def show_profile(self, ctx, user):
+        """Show a user's ID profile"""
+        try:
+            
+            if not self.table_exists(ctx.guild.id, "user_profiles"):
+                await ctx.send(f"❌ ID profiles haven't been set up in this server yet.\nBut {user.mention}'s Discord ID is: `{user.id}`")
+                return
+            
+            conn = self.get_cached_connection(ctx.guild.id)
+            if not conn:
+                await ctx.send(f"❌ This server doesn't have ID profiles set up yet.\nBut {user.mention}'s Discord ID is: `{user.id}`")
+                return
+            
+            c = conn.cursor()
+            c.execute('''SELECT server_number, display_name, join_reason, likes, verified_at
+                         FROM user_profiles WHERE user_id = ?''', (str(user.id),))
+            result = c.fetchone()
+            
+            if not result:
+                await ctx.send(f"❌ {user.mention} does not have an ID profile.\nBut their Discord ID is: `{user.id}`")
+                return
+            
+            server_number, display_name, join_reason, likes, verified_at = result
+            
+            embed = discord.Embed(
+                title=f"🆔 ID Profile: {user.name}",
+                color=user.color if user.color.value != 0 else discord.Color.green()
+            )
+            embed.set_thumbnail(url=user.avatar.url if user.avatar else user.default_avatar.url)
+            
+            embed.add_field(name="Server ID #", value=f"`{server_number}`", inline=True)
+            embed.add_field(name="Display Name", value=display_name, inline=True)
+            embed.add_field(name="Verified", value=f"<t:{int(verified_at)}:R>", inline=True)
+            embed.add_field(name="Join Reason", value=join_reason, inline=False)
+            embed.add_field(name="Likes", value=likes, inline=False)
+            
+            # Check if this user has global profile
+            if self.global_user_id == user.id:
+                embed.add_field(name="🌍", value="**Global Profile User**", inline=False)
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            await ctx.send(f"❌ Error loading profile: {e}")
+
+    async def show_server_profile(self, ctx):
+        """Show server profile"""
+        try:
+            # Check if server_profile table exists
+            if not self.table_exists(ctx.guild.id, "server_profile"):
+                return False
+            
+            conn = self.get_cached_connection(ctx.guild.id)
+            if not conn:
+                return False
+            
+            c = conn.cursor()
+            c.execute('''SELECT display_name, description, created_at, created_by
+                         FROM server_profile WHERE guild_id = ?''', (str(ctx.guild.id),))
+            result = c.fetchone()
+            
+            if not result:
+                return False
+            
+            display_name, description, created_at, created_by = result
+            creator = ctx.guild.get_member(int(created_by)) if created_by else None
+            
+            embed = discord.Embed(
+                title=f"🆔 Server Profile: {ctx.guild.name}",
+                description=description,
+                color=discord.Color.gold()
+            )
+            
+            if ctx.guild.icon:
+                embed.set_thumbnail(url=ctx.guild.icon.url)
+            if ctx.guild.banner:
+                embed.set_image(url=ctx.guild.banner.url)
+            
+            embed.add_field(name="Display Name", value=display_name, inline=True)
+            embed.add_field(name="Server ID", value=f"`{ctx.guild.id}`", inline=True)
+            embed.add_field(name="Created", value=f"<t:{int(created_at)}:R>", inline=True)
+            if creator:
+                embed.add_field(name="Profile Created By", value=creator.mention, inline=False)
+            
+            await ctx.send(embed=embed)
+            return True
+            
+        except Exception as e:
+            print(f"Error loading server profile: {e}")
+            return False
+
+    async def show_channel_profile(self, ctx, channel):
+        """Show channel profile"""
+        try:
+            # Check if channel_profiles table exists
+            if not self.table_exists(ctx.guild.id, "channel_profiles"):
+                return False
+            
+            conn = self.get_cached_connection(ctx.guild.id)
+            if not conn:
+                return False
+            
+            c = conn.cursor()
+            c.execute('''SELECT display_name, description, created_at, created_by
+                         FROM channel_profiles WHERE channel_id = ?''', (str(channel.id),))
+            result = c.fetchone()
+            
+            if not result:
+                return False
+            
+            display_name, description, created_at, created_by = result
+            creator = ctx.guild.get_member(int(created_by)) if created_by else None
+            
+            embed = discord.Embed(
+                title=f"🆔 Channel Profile: #{channel.name}",
+                description=description,
+                color=discord.Color.purple()
+            )
+            
+            embed.add_field(name="Display Name", value=display_name, inline=True)
+            embed.add_field(name="Channel ID", value=f"`{channel.id}`", inline=True)
+            embed.add_field(name="Created", value=f"<t:{int(created_at)}:R>", inline=True)
+            if creator:
+                embed.add_field(name="Profile Created By", value=creator.mention, inline=False)
+            
+            await ctx.send(embed=embed)
+            return True
+            
+        except Exception as e:
+            print(f"Error loading channel profile: {e}")
+            return False
+
+    @commands.command(name='idsetglobal')
+    async def idsetglobal(self, ctx):
+        """Set yourself as the global profile user (DM only)"""
+        if await self.check_duplicate(ctx):
+            return
+        
+        # Only works in DMs
+        if not isinstance(ctx.channel, discord.DMChannel):
+            await ctx.send("❌ This command can only be used in DMs with the bot.")
+            return
+        
+        # Check if there's already a global user
+        if self.global_user_id is not None and self.global_user_id != ctx.author.id:
+            await ctx.send("❌ There can only be ONE global profile user, and someone else already has it.")
+            return
+        
+        # Check if user has a profile in any server
+        has_profile = False
+        for guild in self.bot.guilds:
+            if guild.get_member(ctx.author.id):
+                # Check if user_profiles table exists in this guild first
+                if self.table_exists(guild.id, "user_profiles"):
+                    conn = self.get_cached_connection(guild.id)
+                    if conn:
+                        c = conn.cursor()
+                        c.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (str(ctx.author.id),))
+                        if c.fetchone():
+                            has_profile = True
+                            break
+        
+        if not has_profile:
+            await ctx.send("❌ You need to create at least one server profile first using verification or `!idset_users`.")
+            return
+        
+        # Ask for confirmation
+        await ctx.send("⚠️ This will make your profile GLOBAL across all servers. Only ONE person can have this. Type `CONFIRM` to continue.")
+        
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content == "CONFIRM"
+        
+        try:
+            await self.bot.wait_for('message', timeout=30.0, check=check)
+            
+            # Save to database
+            conn = sqlite3.connect(MAIN_DB_PATH)
+            c = conn.cursor()
+            
+            # Clear any existing global user
+            c.execute("DELETE FROM global_profile")
+            
+            # Get user's info from first server profile
+            display_name = "Unknown"
+            join_reason = "Unknown"
+            likes = "Unknown"
+            
+            for guild in self.bot.guilds:
+                if guild.get_member(ctx.author.id):
+                    if self.table_exists(guild.id, "user_profiles"):
+                        conn2 = self.get_cached_connection(guild.id)
+                        if conn2:
+                            c2 = conn2.cursor()
+                            c2.execute("SELECT display_name, join_reason, likes FROM user_profiles WHERE user_id = ?", (str(ctx.author.id),))
+                            result = c2.fetchone()
+                            if result:
+                                display_name, join_reason, likes = result
+                                break
+            
+            c.execute('''INSERT INTO global_profile
+                         (user_id, display_name, join_reason, likes, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?)''',
+                      (str(ctx.author.id), display_name, join_reason, likes, time.time(), time.time()))
+            
+            conn.commit()
+            conn.close()
+            
+            self.global_user_id = ctx.author.id
+            
+            embed = discord.Embed(
+                title="🌍 Global Profile Activated!",
+                description="You are now the ONE global profile user! Your profile will appear in all servers.",
+                color=discord.Color.gold()
+            )
+            embed.add_field(name="Display Name", value=display_name, inline=True)
+            embed.add_field(name="Join Reason", value=join_reason, inline=True)
+            embed.add_field(name="Likes", value=likes, inline=True)
+            
+            await ctx.send(embed=embed)
+            
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Timed out. Global profile setup cancelled.")
+
+    @commands.command(name='idhelp')
+    async def idhelp(self, ctx):
+        """Show help for ID system"""
+        if await self.check_duplicate(ctx):
+            return
+        
+        embed = discord.Embed(
+            title="🆔 ID System Commands",
+            description="Server ID cards and profiles",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="📋 Basic ID Commands (Anyone)",
+            value=(
+                "`!id @user` - View user's ID profile or Discord ID\n"
+                "`!id username` - Get user ID by name\n"
+                "`!id server` - View server profile or ID\n"
+                "`!id channel` - View channel profile or ID\n"
+                "`!id profile` - View your own profile\n"
+                "`!id profile @user` - View someone's profile\n"
+                "`!gid @user` - View a user's global profile"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚙️ Admin Commands (AsaiyaBot only)",
+            value=(
+                "`!idset_users` - DM all users without profiles\n"
+                "`!idset_server` - Set up server profile\n"
+                "`!idset_channel` - Set up current channel profile"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🌍 Special Commands",
+            value=(
+                "`!idsetglobal` - Become the global profile user (DM only, ONE person only)"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚠️ MLBB Server",
+            value="`!id` commands are disabled in the MLBB server. Use `!mlid` instead.",
+            inline=False
+        )
+        
+        embed.set_footer(text="Profiles are server-specific unless you're the global user")
+        
+        await ctx.send(embed=embed)
+
+
+async def setup(bot):
+    await bot.add_cog(IDSystem(bot))

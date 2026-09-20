@@ -1,0 +1,594 @@
+import discord
+from discord.ext import commands
+import sqlite3
+import time
+import asyncio
+import os
+from datetime import datetime
+
+# ===== CONFIGURATION =====
+BUG_SERVER_ID       = 1484265140215087235
+BUG_REPORT_CHANNEL  = 1487038376371556466   # Where !reportbug is typed AND reports are posted
+BUG_TRACKER_CHANNEL = 1484265142718959811   # Where the numbered bug list lives
+STAFF_ROLE          = "AsaiyaBot"
+DB_FOLDER           = r"C:\Users\Kelly\Desktop\discord database"
+BUG_DB_PATH         = os.path.join(DB_FOLDER, "bug_tracker.db")
+
+
+class BugReport(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.bugs = {}              # {bug_number: {...}}
+        self.next_bug_number = 1
+        self.tracker_message_id = None
+        self.active_sessions = set()
+        self.setup_database()
+        print("✅ BugReport cog initialized")
+
+    # ===== DATABASE =====
+
+    def setup_database(self):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS bugs (
+                bug_number      INTEGER PRIMARY KEY,
+                report_msg_id   TEXT,
+                reporter_id     TEXT,
+                description     TEXT,
+                attachment_url  TEXT,
+                reported_at     REAL,
+                fixed           INTEGER DEFAULT 0,
+                fixed_at        REAL,
+                impossible      INTEGER DEFAULT 0,
+                impossible_at    REAL
+            )''')
+            
+            # Check if impossible column exists, add if not
+            c.execute("PRAGMA table_info(bugs)")
+            columns = [col[1] for col in c.fetchall()]
+            if 'impossible' not in columns:
+                c.execute("ALTER TABLE bugs ADD COLUMN impossible INTEGER DEFAULT 0")
+                print("✅ Added 'impossible' column to bugs table")
+            if 'impossible_at' not in columns:
+                c.execute("ALTER TABLE bugs ADD COLUMN impossible_at REAL")
+                print("✅ Added 'impossible_at' column to bugs table")
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS tracker_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )''')
+            conn.commit()
+            conn.close()
+            print(f"✅ Bug tracker database ready: {BUG_DB_PATH}")
+        except Exception as e:
+            print(f"❌ Bug tracker DB error: {e}")
+
+    def save_bug(self, bug_number, report_msg_id, reporter_id,
+                 description, attachment_url, reported_at):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('''INSERT OR REPLACE INTO bugs
+                         (bug_number, report_msg_id, reporter_id, description,
+                          attachment_url, reported_at, fixed, fixed_at, impossible, impossible_at)
+                         VALUES (?, ?, ?, ?, ?, ?, 0, NULL, 0, NULL)''',
+                      (bug_number, str(report_msg_id), str(reporter_id),
+                       description, attachment_url, reported_at))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving bug: {e}")
+
+    def mark_fixed_db(self, bug_number, fixed_at):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('UPDATE bugs SET fixed = 1, fixed_at = ?, impossible = 0, impossible_at = NULL WHERE bug_number = ?',
+                      (fixed_at, bug_number))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error marking bug fixed: {e}")
+
+    def mark_unfixed_db(self, bug_number):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('UPDATE bugs SET fixed = 0, fixed_at = NULL, impossible = 0, impossible_at = NULL WHERE bug_number = ?',
+                      (bug_number,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error marking bug unfixed: {e}")
+
+    def mark_impossible_db(self, bug_number, impossible_at):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('UPDATE bugs SET impossible = 1, impossible_at = ?, fixed = 0, fixed_at = NULL WHERE bug_number = ?',
+                      (impossible_at, bug_number))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error marking bug impossible: {e}")
+
+    def load_all_bugs(self):
+        bugs = {}
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('''SELECT bug_number, report_msg_id, reporter_id, description,
+                                attachment_url, reported_at, fixed, fixed_at, impossible, impossible_at
+                         FROM bugs ORDER BY bug_number ASC''')
+            for row in c.fetchall():
+                num, msg_id, reporter, desc, att, rep_at, fixed, fix_at, impossible, impossible_at = row
+                bugs[num] = {
+                    'report_msg_id': int(msg_id),
+                    'reporter_id':   int(reporter),
+                    'description':   desc,
+                    'attachment_url': att,
+                    'reported_at':   rep_at,
+                    'fixed':         bool(fixed),
+                    'fixed_at':      fix_at,
+                    'impossible':    bool(impossible),
+                    'impossible_at': impossible_at,
+                }
+            conn.close()
+        except Exception as e:
+            print(f"Error loading bugs: {e}")
+        next_num = max(bugs.keys(), default=0) + 1
+        return bugs, next_num
+
+    def save_tracker_msg_id(self, msg_id):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO tracker_meta (key, value) VALUES (?, ?)',
+                      ('tracker_message_id', str(msg_id)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving tracker msg id: {e}")
+
+    def load_tracker_msg_id(self):
+        try:
+            conn = sqlite3.connect(BUG_DB_PATH)
+            c = conn.cursor()
+            c.execute('SELECT value FROM tracker_meta WHERE key = ?',
+                      ('tracker_message_id',))
+            row = c.fetchone()
+            conn.close()
+            return int(row[0]) if row else None
+        except:
+            return None
+
+    # ===== HELPERS =====
+
+    def format_time(self, ts=None):
+        dt = datetime.utcfromtimestamp(ts if ts else time.time())
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+    async def get_tracker_message(self, guild):
+        channel = guild.get_channel(BUG_TRACKER_CHANNEL)
+        if not channel:
+            return None
+
+        # Try in-memory cache
+        if self.tracker_message_id:
+            try:
+                return await channel.fetch_message(self.tracker_message_id)
+            except discord.NotFound:
+                self.tracker_message_id = None
+
+        # Try DB-stored ID
+        db_id = self.load_tracker_msg_id()
+        if db_id:
+            try:
+                msg = await channel.fetch_message(db_id)
+                self.tracker_message_id = db_id
+                return msg
+            except discord.NotFound:
+                pass
+
+        # Scan channel as last resort
+        async for msg in channel.history(limit=20):
+            if msg.author == self.bot.user and \
+                    msg.content.startswith("**🐛 Bugs Found:**"):
+                self.tracker_message_id = msg.id
+                self.save_tracker_msg_id(msg.id)
+                return msg
+
+        return None
+
+    async def rebuild_tracker(self, guild):
+        channel = guild.get_channel(BUG_TRACKER_CHANNEL)
+        if not channel:
+            return
+
+        if not self.bugs:
+            content = "**🐛 Bugs Found:**\n*No bugs reported yet.*"
+        else:
+            lines = ["**🐛 Bugs Found:**"]
+            for num in sorted(self.bugs.keys()):
+                bug = self.bugs[num]
+                link = (f"https://discord.com/channels/{guild.id}"
+                        f"/{BUG_REPORT_CHANNEL}/{bug['report_msg_id']}")
+                
+                if bug.get('impossible', False):
+                    lines.append(f"{num}.) {link} ❌ Can't fix this")
+                elif bug.get('fixed', False):
+                    lines.append(f"~~{num}.) {link}~~ ✅ Fixed")
+                else:
+                    lines.append(f"{num}.) {link}")
+            content = "\n".join(lines)
+
+        existing = await self.get_tracker_message(guild)
+        if existing:
+            await existing.edit(content=content)
+        else:
+            msg = await channel.send(content)
+            self.tracker_message_id = msg.id
+            self.save_tracker_msg_id(msg.id)
+
+    # ===== ON READY =====
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        self.bugs, self.next_bug_number = self.load_all_bugs()
+        print(f"✅ BugReport: loaded {len(self.bugs)} bug(s) "
+              f"(next #{self.next_bug_number})")
+
+    # ===== COMMANDS =====
+
+    @commands.command(name='reportbug')
+    async def report_bug(self, ctx):
+        """Report a bug. Only works in the bug report channel."""
+        if ctx.guild is None or ctx.guild.id != BUG_SERVER_ID:
+            return
+
+        if ctx.channel.id != BUG_REPORT_CHANNEL:
+            channel = ctx.guild.get_channel(BUG_REPORT_CHANNEL)
+            mention = channel.mention if channel else f"<#{BUG_REPORT_CHANNEL}>"
+            await ctx.send(f"❌ Please use {mention} to report bugs!", delete_after=8)
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            return
+
+        if ctx.author.id in self.active_sessions:
+            await ctx.send(
+                f"⚠️ {ctx.author.mention} You already have an active bug report session!",
+                delete_after=10
+            )
+            return
+
+        self.active_sessions.add(ctx.author.id)
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            # ── Step 1: Description ────────────────────────────────────────
+            prompt1 = await ctx.send(
+                f"🐛 {ctx.author.mention} **Bug Report**\n"
+                f"Please describe the bug in detail:"
+            )
+            try:
+                desc_msg = await self.bot.wait_for('message', timeout=120.0, check=check)
+                bug_description = desc_msg.content
+            except asyncio.TimeoutError:
+                await prompt1.edit(content="⏰ Bug report timed out. Please try again.")
+                return
+
+            # ── Step 2: Image / video ──────────────────────────────────────
+            prompt2 = await ctx.send(
+                f"📎 {ctx.author.mention} Please send an **image or video** of the bug, "
+                f"or type `skip` if you don't have one:"
+            )
+            try:
+                media_msg = await self.bot.wait_for('message', timeout=120.0, check=check)
+            except asyncio.TimeoutError:
+                await prompt2.edit(content="⏰ Bug report timed out. Please try again.")
+                return
+
+            skipped = media_msg.content.strip().lower() == 'skip'
+            attachment_url = None
+            if not skipped and media_msg.attachments:
+                attachment_url = media_msg.attachments[0].url
+            elif not skipped and not media_msg.attachments:
+                await ctx.send(
+                    "⚠️ No attachment detected and you didn't type `skip`. "
+                    "Treating as skipped.",
+                    delete_after=6
+                )
+
+            # ── Step 3: Post report embed ──────────────────────────────────
+            reported_at = time.time()
+            bug_number  = self.next_bug_number
+
+            embed = discord.Embed(
+                title=f"🐛 Bug Report #{bug_number}",
+                color=discord.Color.red(),
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="👤 Person who found the bug",
+                            value=ctx.author.mention, inline=False)
+            embed.add_field(name="📝 Details about the bug",
+                            value=bug_description, inline=False)
+            embed.add_field(name="🖼️ Image or Video",
+                            value=attachment_url if attachment_url else "*Not provided*",
+                            inline=False)
+            embed.add_field(name="🕐 Reported at",
+                            value=self.format_time(reported_at), inline=True)
+            embed.add_field(name="✅ Fixed at",
+                            value="*Pending...*", inline=True)
+            embed.set_footer(text=f"Bug #{bug_number} | {ctx.guild.name}")
+
+            report_channel = ctx.guild.get_channel(BUG_REPORT_CHANNEL)
+            report_msg = await report_channel.send(embed=embed)
+
+            if attachment_url:
+                await report_channel.send(
+                    f"📎 Attachment for Bug #{bug_number}: {attachment_url}"
+                )
+
+            # ── Step 4: Save and update tracker ───────────────────────────
+            self.bugs[bug_number] = {
+                'report_msg_id': report_msg.id,
+                'reporter_id':   ctx.author.id,
+                'description':   bug_description,
+                'attachment_url': attachment_url,
+                'reported_at':   reported_at,
+                'fixed':         False,
+                'fixed_at':      None,
+                'impossible':    False,
+                'impossible_at': None,
+            }
+            self.next_bug_number += 1
+
+            self.save_bug(bug_number, report_msg.id, ctx.author.id,
+                          bug_description, attachment_url, reported_at)
+
+            await self.rebuild_tracker(ctx.guild)
+
+            # ── Step 5: Confirm to user ────────────────────────────────────
+            tracker_channel = ctx.guild.get_channel(BUG_TRACKER_CHANNEL)
+            await ctx.send(
+                f"✅ {ctx.author.mention} The owner has been told about this bug! "
+                f"Please wait for updates at "
+                f"{tracker_channel.mention if tracker_channel else str(BUG_TRACKER_CHANNEL)}"
+            )
+
+            for m in [prompt1, prompt2, ctx.message, desc_msg, media_msg]:
+                try:
+                    await m.delete()
+                except:
+                    pass
+
+        except Exception as e:
+            await ctx.send(f"❌ Something went wrong: {e}")
+            print(f"BugReport error: {e}")
+        finally:
+            self.active_sessions.discard(ctx.author.id)
+
+    @commands.command(name='fixbug')
+    async def fix_bug(self, ctx, bug_number: str = None):
+        """Mark a bug as fixed. Usage: !fixbug [number]"""
+        if ctx.guild is None or ctx.guild.id != BUG_SERVER_ID:
+            return
+
+        if not any(r.name == STAFF_ROLE for r in ctx.author.roles):
+            await ctx.send("❌ Only staff members can use this command!")
+            return
+
+        if not bug_number:
+            await ctx.send("❌ Please provide a bug number! Usage: `!fixbug 1`")
+            return
+
+        try:
+            num = int(bug_number.lstrip('#'))
+        except ValueError:
+            await ctx.send("❌ Invalid bug number!")
+            return
+
+        if num not in self.bugs:
+            await ctx.send(f"❌ Bug #{num} not found!")
+            return
+
+        if self.bugs[num].get('fixed', False):
+            await ctx.send(f"⚠️ Bug #{num} is already marked as fixed!")
+            return
+
+        if self.bugs[num].get('impossible', False):
+            await ctx.send(f"⚠️ Bug #{num} is marked as impossible to fix. Use `!unfix {num}` first if you want to change it to fixed.")
+            return
+
+        fixed_at = time.time()
+        self.bugs[num]['fixed']    = True
+        self.bugs[num]['fixed_at'] = fixed_at
+        self.bugs[num]['impossible'] = False
+        self.bugs[num]['impossible_at'] = None
+
+        self.mark_fixed_db(num, fixed_at)
+
+        # Edit original embed to fill in Fixed at
+        report_channel = ctx.guild.get_channel(BUG_REPORT_CHANNEL)
+        if report_channel:
+            try:
+                report_msg = await report_channel.fetch_message(
+                    self.bugs[num]['report_msg_id']
+                )
+                if report_msg.embeds:
+                    old = report_msg.embeds[0]
+                    new_embed = discord.Embed(
+                        title=old.title,
+                        color=discord.Color.green(),
+                        timestamp=old.timestamp
+                    )
+                    if old.footer:
+                        new_embed.set_footer(text=old.footer.text)
+                    for field in old.fields:
+                        if field.name == "✅ Fixed at":
+                            new_embed.add_field(name="✅ Fixed at",
+                                                value=self.format_time(fixed_at),
+                                                inline=True)
+                        else:
+                            new_embed.add_field(name=field.name,
+                                                value=field.value,
+                                                inline=field.inline)
+                    await report_msg.edit(embed=new_embed)
+            except Exception as e:
+                print(f"Error editing report message: {e}")
+
+        await self.rebuild_tracker(ctx.guild)
+        await ctx.send(f"✅ Bug #{num} marked as fixed! The tracker has been updated.")
+
+    @commands.command(name='unfix')
+    async def unfix_bug(self, ctx, bug_number: str = None):
+        """Mark a bug as unfixed (remove fixed status). Usage: !unfix [number]"""
+        if ctx.guild is None or ctx.guild.id != BUG_SERVER_ID:
+            return
+
+        if not any(r.name == STAFF_ROLE for r in ctx.author.roles):
+            await ctx.send("❌ Only staff members can use this command!")
+            return
+
+        if not bug_number:
+            await ctx.send("❌ Please provide a bug number! Usage: `!unfix 1`")
+            return
+
+        try:
+            num = int(bug_number.lstrip('#'))
+        except ValueError:
+            await ctx.send("❌ Invalid bug number!")
+            return
+
+        if num not in self.bugs:
+            await ctx.send(f"❌ Bug #{num} not found!")
+            return
+
+        if not self.bugs[num].get('fixed', False) and not self.bugs[num].get('impossible', False):
+            await ctx.send(f"⚠️ Bug #{num} is not marked as fixed or impossible!")
+            return
+
+        # Reset both fixed and impossible status
+        self.bugs[num]['fixed'] = False
+        self.bugs[num]['fixed_at'] = None
+        self.bugs[num]['impossible'] = False
+        self.bugs[num]['impossible_at'] = None
+
+        self.mark_unfixed_db(num)
+
+        # Edit original embed to remove Fixed at
+        report_channel = ctx.guild.get_channel(BUG_REPORT_CHANNEL)
+        if report_channel:
+            try:
+                report_msg = await report_channel.fetch_message(
+                    self.bugs[num]['report_msg_id']
+                )
+                if report_msg.embeds:
+                    old = report_msg.embeds[0]
+                    new_embed = discord.Embed(
+                        title=old.title,
+                        color=discord.Color.red(),
+                        timestamp=old.timestamp
+                    )
+                    if old.footer:
+                        new_embed.set_footer(text=old.footer.text)
+                    for field in old.fields:
+                        if field.name == "✅ Fixed at":
+                            new_embed.add_field(name="✅ Fixed at",
+                                                value="*Pending...*",
+                                                inline=True)
+                        else:
+                            new_embed.add_field(name=field.name,
+                                                value=field.value,
+                                                inline=field.inline)
+                    await report_msg.edit(embed=new_embed)
+            except Exception as e:
+                print(f"Error editing report message: {e}")
+
+        await self.rebuild_tracker(ctx.guild)
+        
+        status_text = "fixed" if self.bugs[num].get('fixed') else "impossible"
+        await ctx.send(f"✅ Bug #{num} is no longer marked as {status_text}! The tracker has been updated.")
+
+    @commands.command(name='impossiblefix')
+    async def impossible_fix(self, ctx, bug_number: str = None):
+        """Mark a bug as impossible to fix. Usage: !impossiblefix [number]"""
+        if ctx.guild is None or ctx.guild.id != BUG_SERVER_ID:
+            return
+
+        if not any(r.name == STAFF_ROLE for r in ctx.author.roles):
+            await ctx.send("❌ Only staff members can use this command!")
+            return
+
+        if not bug_number:
+            await ctx.send("❌ Please provide a bug number! Usage: `!impossiblefix 1`")
+            return
+
+        try:
+            num = int(bug_number.lstrip('#'))
+        except ValueError:
+            await ctx.send("❌ Invalid bug number!")
+            return
+
+        if num not in self.bugs:
+            await ctx.send(f"❌ Bug #{num} not found!")
+            return
+
+        if self.bugs[num].get('impossible', False):
+            await ctx.send(f"⚠️ Bug #{num} is already marked as impossible to fix!")
+            return
+
+        if self.bugs[num].get('fixed', False):
+            await ctx.send(f"⚠️ Bug #{num} is marked as fixed. Use `!unfix {num}` first if you want to change it to impossible.")
+            return
+
+        impossible_at = time.time()
+        self.bugs[num]['impossible'] = True
+        self.bugs[num]['impossible_at'] = impossible_at
+        self.bugs[num]['fixed'] = False
+        self.bugs[num]['fixed_at'] = None
+
+        self.mark_impossible_db(num, impossible_at)
+
+        # Edit original embed to mark as impossible
+        report_channel = ctx.guild.get_channel(BUG_REPORT_CHANNEL)
+        if report_channel:
+            try:
+                report_msg = await report_channel.fetch_message(
+                    self.bugs[num]['report_msg_id']
+                )
+                if report_msg.embeds:
+                    old = report_msg.embeds[0]
+                    new_embed = discord.Embed(
+                        title=old.title,
+                        color=discord.Color.dark_red(),
+                        timestamp=old.timestamp
+                    )
+                    if old.footer:
+                        new_embed.set_footer(text=old.footer.text)
+                    
+                    # Update the embed fields
+                    for field in old.fields:
+                        if field.name == "✅ Fixed at":
+                            new_embed.add_field(name="❌ Can't Fix This",
+                                                value=self.format_time(impossible_at),
+                                                inline=True)
+                        else:
+                            new_embed.add_field(name=field.name,
+                                                value=field.value,
+                                                inline=field.inline)
+                    await report_msg.edit(embed=new_embed)
+            except Exception as e:
+                print(f"Error editing report message: {e}")
+
+        await self.rebuild_tracker(ctx.guild)
+        await ctx.send(f"✅ Bug #{num} marked as impossible to fix! The tracker has been updated.")
+
+
+async def setup(bot):
+    await bot.add_cog(BugReport(bot))
